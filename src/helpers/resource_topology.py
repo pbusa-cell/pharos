@@ -7,7 +7,6 @@
 # coordination, and artifact tracking.
 # ============================================================================
 
-import asyncio
 import json
 import logging
 from datetime import datetime
@@ -19,8 +18,10 @@ from helpers.utils import calculate_context_tokens
 # (src/ on path) and in tooling contexts (repo root on path).
 try:
     from core.readonly_client import ReadOnlyK8sClient
+    from core.k8s_async import k8s_call
 except ImportError:
     from src.core.readonly_client import ReadOnlyK8sClient
+    from src.core.k8s_async import k8s_call
 
 logger = logging.getLogger("lumino-mcp")
 
@@ -804,9 +805,7 @@ async def analyze_service_dependencies(
         if pods_list is not None:
             pods_items = pods_list
         else:
-            import asyncio
-
-            pods = await asyncio.to_thread(core_api.list_namespaced_pod, namespace=namespace)
+            pods = await k8s_call(core_api.list_namespaced_pod, namespace=namespace)
             pods_items = pods.items
 
         for pod in pods_items:
@@ -1044,9 +1043,9 @@ async def identify_affected_components(
                     # Off-loop + bounded (final fix wave, I-1): this call was
                     # synchronous and unbounded, blocking the event loop on a
                     # degraded API path with no cap on payload size.
-                    deployments = await asyncio.to_thread(
+                    deployments = await k8s_call(
                         k8s_apps_api.list_namespaced_deployment, namespace,
-                        limit=200, _request_timeout=30)
+                        limit=200, timeout=30)
                     for deployment in deployments.items:
                         component_info = {
                             "component": f"deployment/{deployment.metadata.name}",
@@ -1113,9 +1112,9 @@ async def identify_affected_components(
                     # Off-loop + bounded (final fix wave, I-1): same treatment
                     # as the scaling branch above — synchronous, unbounded,
                     # on-loop call had no cap and no client-side timeout.
-                    services = await asyncio.to_thread(
+                    services = await k8s_call(
                         k8s_core_api.list_namespaced_service, namespace,
-                        limit=200, _request_timeout=30)
+                        limit=200, timeout=30)
                     for service in services.items:
                         component_info = {
                             "component": f"service/{service.metadata.name}",
@@ -1238,7 +1237,7 @@ async def _process_namespace_topology(
     pods_list = None
     if "pods" in component_types or "services" in component_types:
         try:
-            pods_result = await asyncio.to_thread(core_api.list_namespaced_pod, namespace=namespace)
+            pods_result = await k8s_call(core_api.list_namespaced_pod, namespace=namespace)
             pods_list = pods_result.items
         except Exception as e:
             logger.debug(f"Could not pre-fetch pods for {namespace}: {e}")
@@ -1247,7 +1246,7 @@ async def _process_namespace_topology(
         # Process Deployments
         if "deployments" in component_types:
             try:
-                deployments = await asyncio.to_thread(apps_api.list_namespaced_deployment, namespace=namespace)
+                deployments = await k8s_call(apps_api.list_namespaced_deployment, namespace=namespace)
                 permissions["accessible"].append(f"{cluster_name}/{namespace}/deployments")
 
                 for deployment in deployments.items:
@@ -1295,7 +1294,7 @@ async def _process_namespace_topology(
         # Process ReplicaSets (needed for complete Deployment→ReplicaSet→Pod ownership chain)
         if "replicasets" in component_types:
             try:
-                replicasets = await asyncio.to_thread(apps_api.list_namespaced_replica_set, namespace=namespace)
+                replicasets = await k8s_call(apps_api.list_namespaced_replica_set, namespace=namespace)
                 permissions["accessible"].append(f"{cluster_name}/{namespace}/replicasets")
 
                 for replicaset in replicasets.items:
@@ -1342,7 +1341,7 @@ async def _process_namespace_topology(
         # Process Services
         if "services" in component_types:
             try:
-                services = await asyncio.to_thread(core_api.list_namespaced_service, namespace=namespace)
+                services = await k8s_call(core_api.list_namespaced_service, namespace=namespace)
                 permissions["accessible"].append(f"{cluster_name}/{namespace}/services")
 
                 for service in services.items:
@@ -1394,7 +1393,7 @@ async def _process_namespace_topology(
                 if pods_list is not None:
                     pods_items = pods_list
                 else:
-                    pods_result = await asyncio.to_thread(core_api.list_namespaced_pod, namespace=namespace)
+                    pods_result = await k8s_call(core_api.list_namespaced_pod, namespace=namespace)
                     pods_items = pods_result.items
                 for pod in pods_items:
                     node_id = generate_node_id(cluster_name, namespace, "pod", pod.metadata.name)
@@ -1439,7 +1438,7 @@ async def _process_namespace_topology(
         # Process PVCs
         if "persistentvolumeclaims" in component_types:
             try:
-                pvcs = await asyncio.to_thread(core_api.list_namespaced_persistent_volume_claim, namespace=namespace)
+                pvcs = await k8s_call(core_api.list_namespaced_persistent_volume_claim, namespace=namespace)
                 for pvc in pvcs.items:
                     node_id = generate_node_id(cluster_name, namespace, "persistentvolumeclaim", pvc.metadata.name)
 
@@ -1476,7 +1475,7 @@ async def _process_namespace_topology(
         # Process ConfigMaps
         if "configmaps" in component_types:
             try:
-                configmaps = await asyncio.to_thread(core_api.list_namespaced_config_map, namespace=namespace)
+                configmaps = await k8s_call(core_api.list_namespaced_config_map, namespace=namespace)
                 permissions["accessible"].append(f"{cluster_name}/{namespace}/configmaps")
 
                 for cm in configmaps.items:
@@ -1512,7 +1511,7 @@ async def _process_namespace_topology(
         # Process Secrets (NOT included in defaults due to common RBAC restrictions)
         if "secrets" in component_types:
             try:
-                secrets = await asyncio.to_thread(core_api.list_namespaced_secret, namespace=namespace)
+                secrets = await k8s_call(core_api.list_namespaced_secret, namespace=namespace)
                 permissions["accessible"].append(f"{cluster_name}/{namespace}/secrets")
 
                 for secret in secrets.items:
@@ -1549,7 +1548,7 @@ async def _process_namespace_topology(
         # Process Tekton PipelineRuns
         if "pipelineruns" in component_types:
             try:
-                pipeline_runs = await asyncio.to_thread(
+                pipeline_runs = await k8s_call(
                     custom_api.list_namespaced_custom_object,
                     group="tekton.dev",
                     version="v1",
@@ -1598,7 +1597,7 @@ async def _process_namespace_topology(
         # Process Tekton Pipelines
         if "pipelines" in component_types:
             try:
-                pipelines = await asyncio.to_thread(
+                pipelines = await k8s_call(
                     custom_api.list_namespaced_custom_object,
                     group="tekton.dev",
                     version="v1",
@@ -1631,7 +1630,7 @@ async def _process_namespace_topology(
         # Process Tekton TaskRuns
         if "taskruns" in component_types:
             try:
-                task_runs = await asyncio.to_thread(
+                task_runs = await k8s_call(
                     custom_api.list_namespaced_custom_object,
                     group="tekton.dev",
                     version="v1",
@@ -1706,7 +1705,7 @@ async def _process_namespace_topology(
         # Process Tekton Tasks
         if "tasks" in component_types:
             try:
-                tasks = await asyncio.to_thread(
+                tasks = await k8s_call(
                     custom_api.list_namespaced_custom_object,
                     group="tekton.dev",
                     version="v1",

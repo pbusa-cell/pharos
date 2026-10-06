@@ -34,7 +34,7 @@ class FakeCustomApi:
         self.get_calls = []
         self.list_calls = []
 
-    def get_namespaced_custom_object(self, group, version, namespace, plural, name):
+    def get_namespaced_custom_object(self, group, version, namespace, plural, name, **kwargs):
         self.get_calls.append((plural, namespace, name))
         if plural == "snapshots" and namespace == ORIGIN_NS and name == SNAPSHOT_NAME:
             return {

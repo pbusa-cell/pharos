@@ -17,8 +17,10 @@ from typing import Any, Dict, List, Optional
 
 # Guarded import mirrors the pattern in helpers/resource_topology.py.
 try:
+    from core.k8s_async import k8s_call
     from core.readonly_client import ReadOnlyK8sClient
 except ImportError:
+    from src.core.k8s_async import k8s_call
     from src.core.readonly_client import ReadOnlyK8sClient
 
 from helpers.resource_topology import (
@@ -96,7 +98,7 @@ async def correlate_pipeline_events(
         """Query PipelineRuns in a single namespace - designed for parallel execution."""
         results = []
         try:
-            pipeline_runs = custom_api.list_namespaced_custom_object(
+            pipeline_runs = await k8s_call(custom_api.list_namespaced_custom_object,
                 group="tekton.dev",
                 version="v1",
                 namespace=namespace,
@@ -142,7 +144,7 @@ async def correlate_pipeline_events(
             else:
                 # Auto-detect namespaces with tekton prioritization
                 try:
-                    ns_list = clients["core_api"].list_namespace()
+                    ns_list = await k8s_call(clients["core_api"].list_namespace)
                     all_namespaces = [ns.metadata.name for ns in ns_list.items]
 
                     if tekton_namespaces:
@@ -583,7 +585,7 @@ def summarize_stages(
 async def _resolve_plr(custom_api, namespace: str, plr_name: str, logger=None) -> Optional[Dict]:
     """Fetch a single PipelineRun resource."""
     try:
-        return custom_api.get_namespaced_custom_object(
+        return await k8s_call(custom_api.get_namespaced_custom_object,
             group="tekton.dev",
             version="v1",
             namespace=namespace,
@@ -601,7 +603,7 @@ async def _resolve_application(
 ) -> Optional[Dict]:
     """Fetch an Application resource and extract key fields."""
     try:
-        app = custom_api.get_namespaced_custom_object(
+        app = await k8s_call(custom_api.get_namespaced_custom_object,
             group="appstudio.redhat.com",
             version="v1alpha1",
             namespace=namespace,
@@ -613,7 +615,7 @@ async def _resolve_application(
         # Count components belonging to this application
         component_count = 0
         try:
-            comp_list = custom_api.list_namespaced_custom_object(
+            comp_list = await k8s_call(custom_api.list_namespaced_custom_object,
                 group="appstudio.redhat.com",
                 version="v1alpha1",
                 namespace=namespace,
@@ -641,7 +643,7 @@ async def _resolve_component(
 ) -> Optional[Dict]:
     """Fetch a Component resource and extract key fields."""
     try:
-        comp = custom_api.get_namespaced_custom_object(
+        comp = await k8s_call(custom_api.get_namespaced_custom_object,
             group="appstudio.redhat.com",
             version="v1alpha1",
             namespace=namespace,
@@ -700,7 +702,7 @@ async def _resolve_snapshot(
 ) -> Optional[Dict]:
     """Fetch a Snapshot resource and extract key fields."""
     try:
-        snapshot = custom_api.get_namespaced_custom_object(
+        snapshot = await k8s_call(custom_api.get_namespaced_custom_object,
             group="appstudio.redhat.com",
             version="v1alpha1",
             namespace=namespace,
@@ -819,7 +821,7 @@ async def _resolve_releases_for_snapshot(
     """Find Release resources linked to a snapshot via label."""
     releases = []
     try:
-        release_list = custom_api.list_namespaced_custom_object(
+        release_list = await k8s_call(custom_api.list_namespaced_custom_object,
             group="appstudio.redhat.com",
             version="v1alpha1",
             namespace=namespace,
@@ -886,7 +888,7 @@ async def _resolve_release_pipelines(custom_api, release: Dict, logger=None) -> 
         ns, name = ref.split("/", 1)
 
         try:
-            plr = custom_api.get_namespaced_custom_object(
+            plr = await k8s_call(custom_api.get_namespaced_custom_object,
                 group="tekton.dev", version="v1", namespace=ns, plural="pipelineruns", name=name
             )
             status = plr.get("status", {})
@@ -1032,7 +1034,7 @@ async def _resolve_nudge_cascade(
 
     try:
         # List recent PLRs in the same namespace
-        plr_list = custom_api.list_namespaced_custom_object(
+        plr_list = await k8s_call(custom_api.list_namespaced_custom_object,
             group="tekton.dev", version="v1", namespace=namespace, plural="pipelineruns", limit=50
         )
 

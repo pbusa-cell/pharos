@@ -29,10 +29,12 @@ logger = logging.getLogger("lumino-mcp.kubearchive")
 # Guarded import so helpers.kubearchive_integration is importable both at
 # runtime (src/ on path) and in isolated pytest collection (src/ not on path).
 try:
+    from core.k8s_async import k8s_call
     from core.namespace_trust import namespace_is_trusted
     from core.readonly_client import ReadOnlyK8sClient
     from core.tls import TLS_HINT, bearer_token_allowed, client_ssl_context, is_loopback
 except ImportError:
+    from src.core.k8s_async import k8s_call
     from src.core.namespace_trust import namespace_is_trusted
     from src.core.readonly_client import ReadOnlyK8sClient
     from src.core.tls import TLS_HINT, bearer_token_allowed, client_ssl_context, is_loopback
@@ -276,7 +278,7 @@ class KubeArchiveEndpointDiscovery:
         try:
             for namespace in self._common_namespaces:
                 try:
-                    route = self.k8s_custom_api.get_namespaced_custom_object(
+                    route = await k8s_call(self.k8s_custom_api.get_namespaced_custom_object,
                         group='route.openshift.io',
                         version='v1',
                         namespace=namespace,
@@ -315,7 +317,7 @@ class KubeArchiveEndpointDiscovery:
         try:
             for namespace in self._common_namespaces:
                 try:
-                    ingress = self.k8s_networking_api.read_namespaced_ingress(
+                    ingress = await k8s_call(self.k8s_networking_api.read_namespaced_ingress,
                         name='kubearchive-api-server',
                         namespace=namespace
                     )
@@ -364,7 +366,7 @@ class KubeArchiveEndpointDiscovery:
         try:
             for namespace in self._common_namespaces:
                 try:
-                    service = self.k8s_core_api.read_namespaced_service(
+                    service = await k8s_call(self.k8s_core_api.read_namespaced_service,
                         name='kubearchive-api-server',
                         namespace=namespace
                     )

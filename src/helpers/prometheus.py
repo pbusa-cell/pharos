@@ -7,6 +7,7 @@ import logging
 import aiohttp
 from typing import Dict, List, Optional, Any
 from kubernetes import client
+from core.k8s_async import k8s_call
 from core.namespace_trust import namespace_is_trusted
 from core.readonly_client import ReadOnlyK8sClient
 from core.tls import PLAIN_HTTP_TOKEN_HINT, TLS_HINT, bearer_token_allowed, client_ssl_context
@@ -218,7 +219,7 @@ async def _discover_prometheus_via_routes(custom_api) -> Optional[str]:
     try:
         _ro = ReadOnlyK8sClient.wrap(custom_api)
         # Query routes in openshift-monitoring namespace
-        routes = _ro.list_namespaced_custom_object(
+        routes = await k8s_call(_ro.list_namespaced_custom_object,
             group="route.openshift.io",
             version="v1",
             namespace="openshift-monitoring",
@@ -317,7 +318,7 @@ async def _discover_prometheus_via_operator_crd(custom_api, core_api) -> Optiona
         _ro = ReadOnlyK8sClient.wrap(custom_api)
         _ro_core = ReadOnlyK8sClient.wrap(core_api)
         # List all Prometheus custom resources cluster-wide
-        prometheus_resources = _ro.list_cluster_custom_object(
+        prometheus_resources = await k8s_call(_ro.list_cluster_custom_object,
             group="monitoring.coreos.com",
             version="v1",
             plural="prometheuses"
@@ -341,7 +342,7 @@ async def _discover_prometheus_via_operator_crd(custom_api, core_api) -> Optiona
             service_name = f"prometheus-{name}"
 
             try:
-                service = _ro_core.read_namespaced_service(
+                service = await k8s_call(_ro_core.read_namespaced_service,
                     name=service_name,
                     namespace=namespace
                 )
@@ -401,7 +402,7 @@ async def _discover_prometheus_via_services(core_api) -> Optional[str]:
         # First, try specific namespaces
         for namespace in monitoring_namespaces:
             try:
-                services = _ro.list_namespaced_service(namespace=namespace)
+                services = await k8s_call(_ro.list_namespaced_service, namespace=namespace)
                 if not services.items or not namespace_is_trusted(core_api, namespace):
                     continue
 
@@ -460,7 +461,7 @@ async def _discover_prometheus_via_services(core_api) -> Optional[str]:
 
         for label_selector in label_selectors:
             try:
-                services = _ro.list_service_for_all_namespaces(
+                services = await k8s_call(_ro.list_service_for_all_namespaces,
                     label_selector=label_selector
                 )
 
@@ -522,7 +523,7 @@ async def _discover_thanos_via_services(core_api) -> Optional[str]:
         # First pass: check known monitoring namespaces for priority service names
         for namespace in monitoring_namespaces:
             try:
-                services = _ro.list_namespaced_service(namespace=namespace)
+                services = await k8s_call(_ro.list_namespaced_service, namespace=namespace)
                 if not services.items or not namespace_is_trusted(core_api, namespace):
                     continue
 
@@ -568,7 +569,7 @@ async def _discover_thanos_via_services(core_api) -> Optional[str]:
 
         for label_selector in label_selectors:
             try:
-                services = _ro.list_service_for_all_namespaces(
+                services = await k8s_call(_ro.list_service_for_all_namespaces,
                     label_selector=label_selector
                 )
                 service = _first_trusted_service(services, core_api)

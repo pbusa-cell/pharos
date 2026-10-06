@@ -132,7 +132,7 @@ async def test_named_search_uses_admin_created_namespace():
 @pytest.mark.asyncio
 async def test_operator_cr_uses_admin_created_namespace():
     core = _core()
-    core.read_namespaced_service.side_effect = lambda name, namespace: _svc(name, namespace)
+    core.read_namespaced_service.side_effect = lambda name, namespace, **kw: _svc(name, namespace)
     custom = MagicMock()
     custom.list_cluster_custom_object.return_value = {"items": [{"metadata": {"name": "x", "namespace": "monitoring"}}]}
 
@@ -144,7 +144,7 @@ async def test_operator_cr_uses_admin_created_namespace():
 @pytest.mark.asyncio
 async def test_operator_cr_skips_self_provisioned_namespace():
     core = _core(owned={"monitoring"})
-    core.read_namespaced_service.side_effect = lambda name, namespace: _svc(name, namespace)
+    core.read_namespaced_service.side_effect = lambda name, namespace, **kw: _svc(name, namespace)
     custom = MagicMock()
     custom.list_cluster_custom_object.return_value = {"items": [{"metadata": {"name": "x", "namespace": "monitoring"}}]}
 
@@ -162,7 +162,7 @@ def _custom_with_routes(routes):
     """routes: {namespace: host}"""
     custom = MagicMock()
 
-    def get(group, version, namespace, plural, name):
+    def get(group, version, namespace, plural, name, **kw):
         if namespace in routes:
             return {"spec": {"host": routes[namespace], "tls": {"termination": "edge"}}}
         raise ApiException(status=404)

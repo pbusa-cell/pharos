@@ -24,15 +24,15 @@ def _minimal_pod(name):
 
 
 def _fake_clients():
-    def read_namespaced_pod(name, namespace):
+    def read_namespaced_pod(name, namespace, **kwargs):
         if name == "ghost":
             raise ApiException(status=404, reason="Not Found")
         return _minimal_pod(name)
 
     core = SimpleNamespace(
-        read_namespace=lambda ns: SimpleNamespace(),
+        read_namespace=lambda ns, **kw: SimpleNamespace(),
         read_namespaced_pod=read_namespaced_pod,
-        list_namespaced_resource_quota=lambda ns: SimpleNamespace(items=[]),
+        list_namespaced_resource_quota=lambda ns, **kw: SimpleNamespace(items=[]),
     )
     return SimpleNamespace(core_api=core)
 

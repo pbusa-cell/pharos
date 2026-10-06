@@ -37,8 +37,10 @@ logger = logging.getLogger("lumino-mcp")
 # Guarded import so helpers.utils is importable both at runtime (src/ on path)
 # and in isolated pytest collection (src/ not on path).
 try:
+    from core.k8s_async import k8s_call
     from core.readonly_client import ReadOnlyCoreV1, ReadOnlyK8sClient
 except ImportError:
+    from src.core.k8s_async import k8s_call
     from src.core.readonly_client import ReadOnlyCoreV1, ReadOnlyK8sClient
 
 
@@ -1715,7 +1717,7 @@ async def get_pipeline_details(
     try:
         k8s_custom_api = ReadOnlyK8sClient.wrap(k8s_custom_api)
         # Get the pipeline run custom resource
-        pipeline_run_obj = k8s_custom_api.get_namespaced_custom_object(
+        pipeline_run_obj = await k8s_call(k8s_custom_api.get_namespaced_custom_object,
             group="tekton.dev",
             version="v1",
             namespace=namespace,
@@ -1810,7 +1812,7 @@ async def get_task_details(
     try:
         k8s_custom_api = ReadOnlyK8sClient.wrap(k8s_custom_api)
         # Get the task run custom resource
-        task_run_obj = k8s_custom_api.get_namespaced_custom_object(
+        task_run_obj = await k8s_call(k8s_custom_api.get_namespaced_custom_object,
             group="tekton.dev",
             version="v1",
             namespace=namespace,
@@ -3620,7 +3622,7 @@ async def _get_fallback_cluster_health(core_api) -> Dict[str, Any]:
             for ns_name in system_namespaces:
                 try:
                     # Get pods in system namespace
-                    pods = _ro.list_namespaced_pod(namespace=ns_name)
+                    pods = await k8s_call(_ro.list_namespaced_pod, namespace=ns_name)
 
                     total_pods = len(pods.items)
                     running_pods = 0
