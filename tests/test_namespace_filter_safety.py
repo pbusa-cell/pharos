@@ -79,6 +79,11 @@ def test_unsupported_or_invalid_syntax_is_value_error(pattern):
         _helper()(pattern)
 
 
+def test_overly_complex_filter_rejected():
+    with pytest.raises(ValueError, match="too complex"):
+        _helper()(".{1000}" * 12)
+
+
 def test_normal_filters_still_work():
     compile_filter = _helper()
 
@@ -176,3 +181,92 @@ async def test_topology_mapper_reports_rejected_filter(server, monkeypatch, bad)
     assert result.get("error_type") == "invalid_namespace_filter", result
     assert result["topology"] == {"nodes": [], "edges": []}
     core.list_namespace.assert_not_called()
+
+
+# ── valid filters actually filter (end to end) ───────────────────────────────
+
+
+class _Resp:
+    status = 200
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    async def json(self):
+        return self._payload
+
+    async def text(self):
+        return ""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        pass
+
+
+class _Session:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def get(self, url, **kwargs):
+        return _Resp(self._payload)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_prometheus_query_valid_filter_filters_results(server, monkeypatch):
+    import aiohttp
+
+    payload = {"status": "success", "data": {"resultType": "vector", "result": [
+        {"metric": {"namespace": "tenant-a"}, "value": [0, "1"]},
+        {"metric": {"namespace": "tenant-b"}, "value": [0, "2"]},
+        {"metric": {"namespace": "openshift-etcd"}, "value": [0, "3"]},
+    ]}}
+
+    async def _discover(*a, **kw):
+        return ("https://thanos.example.com", "thanos")
+
+    async def _token():
+        return "t"
+
+    monkeypatch.setattr(server, "_discover_prometheus_endpoint", _discover)
+    monkeypatch.setattr(server, "_get_k8s_bearer_token", _token)
+    monkeypatch.setattr(aiohttp, "ClientSession", lambda *a, **kw: _Session(payload))
+
+    result = await server.prometheus_query("up", namespace_filter=r"^tenant-(a|c)$")
+
+    assert result["status"] == "success"
+    assert result["result_count"] == 1
+    assert "tenant-a" in str(result["data"]) and "tenant-b" not in str(result["data"])
+
+
+@pytest.mark.asyncio
+async def test_topology_mapper_valid_filter_maps_only_matching(server, monkeypatch):
+    core = MagicMock()
+    core.list_namespace.return_value = MagicMock(items=[
+        MagicMock(metadata=MagicMock(name=n)) for n in ("tenant-a", "tenant-b", "kube-system")
+    ])
+    for item, n in zip(core.list_namespace.return_value.items, ("tenant-a", "tenant-b", "kube-system")):
+        item.metadata.name = n
+    mapped = []
+
+    async def _clients(*a, **kw):
+        return {"c1": {"core_api": core, "apps_api": MagicMock(), "custom_api": MagicMock(),
+                       "storage_api": MagicMock()}}
+
+    async def _process(namespace, **kw):
+        mapped.append(namespace)
+        return {"nodes": [], "edges": [], "permissions": {"accessible": [], "denied": [], "errors": []}}
+
+    monkeypatch.setattr(server, "get_multi_cluster_topology_clients", _clients)
+    monkeypatch.setattr(server, "_process_namespace_topology", _process)
+
+    await server.live_system_topology_mapper(namespace_filter=r"^tenant-")
+
+    assert sorted(mapped) == ["tenant-a", "tenant-b"]

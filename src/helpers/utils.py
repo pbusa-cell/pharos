@@ -3245,6 +3245,9 @@ async def _generate_synthetic_historical_data(duration_hours: int) -> Dict[str, 
 # Maximum allowed length for user-supplied regex patterns (namespace filters, etc.)
 _MAX_REGEX_PATTERN_LEN = 200
 
+# RE2 program memory limit for namespace filters (see _safe_compile_namespace_filter).
+_NAMESPACE_FILTER_MAX_MEM = 1 << 20
+
 # Detects nested quantifiers that cause catastrophic backtracking (ReDoS).
 # Catches patterns like (a+)+, (a*)+, (a+)*, ([^x]+)+, (?:a+)+, etc.
 # Also catches overlapping-alternation quantifiers like (a|aa)+, (x|xx|xxx)+.
@@ -3291,10 +3294,18 @@ def _safe_compile_namespace_filter(pattern: str) -> Any:
 
     options = re2.Options()
     options.log_errors = False  # no absl parse-error lines on stderr
+    # Namespace names are <= 63 chars; 1 MiB rejects patterns whose matching
+    # cost (linear, but proportional to program size) could still stall the
+    # loop over many namespaces, e.g. ".{1000}" * 12.
+    options.max_mem = _NAMESPACE_FILTER_MAX_MEM
     try:
         return re2.compile(pattern, options=options)
     except re2.error as e:
         detail = e.args[0].decode() if e.args and isinstance(e.args[0], bytes) else str(e)
+        if "too large" in detail:
+            raise ValueError(
+                f"Namespace filter is too complex: {detail}; use a simpler pattern"
+            ) from None
         raise ValueError(
             "Namespace filter is not a supported regular expression "
             f"(RE2 syntax: no backreferences or lookaround): {detail}"
