@@ -41,6 +41,7 @@ from helpers import (
     format_yaml_output,
     format_detailed_output,
     format_summary_output,
+    redact_secret,
     calculate_context_tokens,
     get_all_pod_logs,
     normalize_pod_log_text,
@@ -2127,6 +2128,10 @@ async def get_kubernetes_resource(
 
         if not resource_obj:
             return f"Error: Resource '{name}' of type '{resource_type}' not found in namespace '{namespace}'"
+
+        # Secret values never leave the server; key names and sizes stay visible.
+        if resource_type == 'secret':
+            resource_obj = redact_secret(resource_obj)
 
         # Format output based on requested format
         if output_format.lower() == "yaml":
