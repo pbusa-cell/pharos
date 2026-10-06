@@ -22,10 +22,9 @@ Handler precedence (round-2 V2 — load-bearing order)
         Exception        → 400 (fixed literal)
   → parse try (json.loads + parse_export_logs_request):
         Exception        → 400 (fixed literal)
-  → ring.note_truncated(n) + ring.note_dropped(skipped)
-    + ring.append(recv_ts, record) for each kept record
-    (only the newest ring.capacity records of a batch are parsed into memory
-    at once — C01)
+  → ring.ingest(recv_ts, records, skipped=..., truncated=...) — one atomic
+    batch update (only the newest ring.capacity records of a batch are
+    built — C01)
   → 200 {}
 """
 from __future__ import annotations
@@ -206,11 +205,7 @@ def build_receiver_app(ring: LogRing, opts: dict, token: str | None):
             records, truncated, skipped = parse_newest_log_records(
                 parsed, max_record_bytes=max_record_bytes, max_records=ring.capacity
             )
-            recv_ts = time.time()
-            ring.note_truncated(truncated)
-            ring.note_dropped(skipped)
-            for record in records:
-                ring.append(recv_ts, record)
+            ring.ingest(time.time(), records, skipped=skipped, truncated=truncated)
         except Exception:
             # RecursionError, TypeError, OverflowError, ValueError — none may
             # escape as 5xx (F3).  Fixed literal only — no str(exc) or payload.

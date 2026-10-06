@@ -23,6 +23,8 @@ import sys
 import tracemalloc
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from starlette.testclient import TestClient  # noqa: E402
@@ -143,3 +145,89 @@ def test_receiver_drop_count_includes_existing_ring_contents():
     stats = ring.stats()
     assert stats["buffered"] == 5
     assert stats["dropped_oldest"] == 16 - 5
+
+
+# ── review follow-up: CPU per record, receiver newest path, atomic ingest ────
+
+
+def _counting(monkeypatch, name):
+    calls = []
+    original = getattr(parse, name)
+
+    def wrapper(*a, **kw):
+        calls.append(1)
+        return original(*a, **kw)
+
+    monkeypatch.setattr(parse, name, wrapper)
+    return calls
+
+
+def test_resource_attribute_cost_computed_once_per_resource(monkeypatch):
+    """Records must not recompute str() of every resource attribute (CPU DoS)."""
+    costs = _counting(monkeypatch, "_attr_cost")
+
+    records, _, _ = parse.parse_newest_log_records(
+        _request(_attrs(MAX_ATTRS), [{} for _ in range(2000)]), max_record_bytes=65536, max_records=2000
+    )
+
+    assert len(records) == 2000
+    assert len(costs) == MAX_ATTRS
+
+
+def test_records_share_resource_attributes():
+    records, _, _ = parse.parse_newest_log_records(
+        _request(_attrs(MAX_ATTRS), [{}, {}, {"attributes": _attrs(1, "own")}]),
+        max_record_bytes=65536, max_records=10,
+    )
+
+    a, b, c = (r.attributes for r in records)
+    assert a is b, "records without own attributes must share one mapping"
+    assert c["own0"] == "" and c["a5"] == "" and c["entity"] == "otlp"
+    assert dict(c) == {**{f"a{i}": "" for i in range(MAX_ATTRS)}, "own0": "", "entity": "otlp"}
+    with pytest.raises(TypeError):
+        a["x"] = 1  # shared mapping is read-only
+
+
+def test_newest_mode_builds_only_kept_records(monkeypatch):
+    built = _counting(monkeypatch, "LogRecord")
+
+    records, _, skipped = parse.parse_newest_log_records(
+        _request(_attrs(MAX_ATTRS), [{} for _ in range(50_000)]), max_record_bytes=65536, max_records=10
+    )
+
+    assert len(records) == 10 and skipped == 49_990
+    assert len(built) == 10
+
+
+def test_newest_mode_still_validates_skipped_records():
+    with pytest.raises(ValueError):
+        parse.parse_newest_log_records(
+            _request(_attrs(1), ["not-an-object"] + [{} for _ in range(20)]),
+            max_record_bytes=65536, max_records=5,
+        )
+
+
+def test_receiver_uses_newest_path(monkeypatch):
+    """Fails if the receiver parses every record of a large batch."""
+    built = _counting(monkeypatch, "LogRecord")
+    ring = LogRing(capacity=10)
+    app = build_receiver_app(ring, {"max_body_bytes": 2_000_000, "max_record_bytes": 65536}, None)
+    body = json.dumps(_request(_attrs(MAX_ATTRS), [{} for _ in range(50_000)]))
+
+    resp = TestClient(app).post("/v1/logs", content=body, headers={"content-type": "application/json"})
+
+    assert resp.status_code == 200
+    assert len(built) == 10
+    assert ring.stats()["dropped_oldest"] == 49_990
+
+
+def test_ring_ingest_is_one_atomic_update():
+    ring = LogRing(capacity=3)
+    ring.ingest(1.0, ["a", "b"])
+
+    ring.ingest(2.0, ["x", "y", "z"], skipped=4, truncated=2)
+
+    stats = ring.stats()
+    assert [r for _, r in ring.snapshot()] == ["x", "y", "z"]
+    assert stats["dropped_oldest"] == 4 + 2
+    assert stats["truncated_records"] == 2

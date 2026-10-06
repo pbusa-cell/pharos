@@ -40,9 +40,15 @@ Attribute count limit (C01)
   derived from ALL resource attributes before the limit applies.
 
 Newest-records mode (C01)
-  ``parse_newest_log_records`` keeps only the newest ``max_records`` records
-  of the request while parsing and reports how many older ones it skipped,
-  so a request never materialises more records than the ring can hold.
+  ``parse_newest_log_records`` counts the records first, then only
+  type-checks the older ones and builds just the newest ``max_records``, so a
+  request never materialises more records than the ring can hold.
+
+Shared resource attributes (C01)
+  The size of each resource attribute is computed once per resource, and
+  records share one read-only mapping of the resource attributes (records
+  with their own attributes use a ChainMap over it), so per-record CPU and
+  memory do not grow with the resource attribute count.
 
 Exception surface
   ``parse_export_logs_request`` raises ``ValueError`` for structurally invalid
@@ -59,7 +65,8 @@ from __future__ import annotations
 
 import collections
 import itertools
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+import types
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
 
 from adapters.otlp.rings import iso_z
 from core.signals import LogRecord
@@ -196,10 +203,16 @@ def _extract_entity(resource_attrs: Dict[str, Any]) -> str:
     return "otlp"
 
 
+def _attr_cost(key: str, value: Any) -> int:
+    """Budget cost of one attribute: len(key) + len(str(value))."""
+    return len(key) + len(str(value))
+
+
 def _enforce_budget(
     body: str,
-    attrs: Dict[str, Any],
+    attrs: Mapping[str, Any],
     max_bytes: int,
+    costs: Mapping[str, int],
 ) -> Tuple[str, Dict[str, Any]]:
     """Trim a record's body and attributes to fit within ``max_bytes``.
 
@@ -211,6 +224,8 @@ def _enforce_budget(
     Note: the ``entity`` attribute is budget-EXEMPT and is NOT passed to
     this function.  The caller re-attaches it (capped at
     ``_ENTITY_MAX_CHARS``) after the call so it always survives truncation.
+
+    ``costs`` holds the precomputed ``_attr_cost`` of every attribute.
 
     Returns ``(trimmed_body, kept_attrs)``.
     """
@@ -226,7 +241,7 @@ def _enforce_budget(
     # Attributes fill what remains.
     kept: Dict[str, Any] = {}
     for k, v in attrs.items():
-        attr_size = len(k) + len(str(v))
+        attr_size = costs[k]
         if attr_size <= remaining:
             kept[k] = v
             remaining -= attr_size
@@ -268,7 +283,7 @@ def parse_export_logs_request(
     """
     records: List[LogRecord] = []
     truncated_count = 0
-    for record, truncated in _iter_log_records(body, max_record_bytes):
+    for record, truncated in _iter_log_records(body, max_record_bytes, skip=0):
         records.append(record)
         truncated_count += truncated
     return records, truncated_count
@@ -280,28 +295,28 @@ def parse_newest_log_records(
     max_record_bytes: int,
     max_records: int,
 ) -> Tuple[List[LogRecord], int, int]:
-    """Like :func:`parse_export_logs_request`, but keep only the newest records.
+    """Like :func:`parse_export_logs_request`, but build only the newest records.
 
-    At most ``max_records`` records (the last ones in request order) are held
-    at any time, so memory does not grow with the number of records in the
-    request.
+    The request is validated as a whole (same ValueErrors), but only the last
+    ``max_records`` records in request order are built; older ones are only
+    type-checked.
 
     Returns ``(records, truncated_count, skipped_count)``. ``truncated_count``
-    covers every parsed record; ``skipped_count`` is the number of older
-    records not returned — the caller counts them as dropped from the ring.
+    covers the returned records; ``skipped_count`` is the number of older
+    records not built — the caller counts them as dropped from the ring.
     """
-    newest: "collections.deque[LogRecord]" = collections.deque(maxlen=max_records)
+    total = _count_log_records(body)
+    skip = max(0, total - max_records)
+    records: List[LogRecord] = []
     truncated_count = 0
-    total = 0
-    for record, truncated in _iter_log_records(body, max_record_bytes):
-        newest.append(record)
+    for record, truncated in _iter_log_records(body, max_record_bytes, skip=skip):
+        records.append(record)
         truncated_count += truncated
-        total += 1
-    return list(newest), truncated_count, total - len(newest)
+    return records, truncated_count, skip
 
 
-def _iter_log_records(body: Any, max_record_bytes: int) -> Iterator[Tuple[LogRecord, bool]]:
-    """Yield ``(record, was_truncated)`` for each log record in request order."""
+def _scope_record_lists(body: Any) -> Iterator[Tuple[dict, list]]:
+    """Yield ``(resourceLogs entry, logRecords list)``; raise on bad structure."""
     if not isinstance(body, dict):
         raise ValueError(
             "OTLP request body must be a JSON object (dict)"
@@ -318,15 +333,6 @@ def _iter_log_records(body: Any, max_record_bytes: int) -> Iterator[Tuple[LogRec
             raise ValueError(
                 "OTLP body: each resourceLogs entry must be an object"
             )
-
-        # Resource-level attributes (used for entity resolution).
-        resource_raw = rl.get("resource", {})
-        if not isinstance(resource_raw, dict):
-            resource_raw = {}
-        resource_attrs = _parse_attrs(resource_raw.get("attributes", []))
-        # Entity comes from ALL resource attributes; the count limit applies after.
-        entity = _extract_entity(resource_attrs)
-        resource_attrs, resource_capped = _cap_attrs(resource_attrs)
 
         scope_logs_raw = rl.get("scopeLogs", [])
         if not isinstance(scope_logs_raw, list):
@@ -345,59 +351,118 @@ def _iter_log_records(body: Any, max_record_bytes: int) -> Iterator[Tuple[LogRec
                 raise ValueError(
                     "OTLP body: 'logRecords' must be an array"
                 )
+            yield rl, log_records_raw
 
-            for lr in log_records_raw:
-                if not isinstance(lr, dict):
-                    raise ValueError(
-                        "OTLP body: each logRecords entry must be an object"
-                    )
 
-                # ── Timestamp (clamped — never raises) ────────────────────
-                timestamp = _parse_nano_to_iso(lr.get("timeUnixNano"))
+def _count_log_records(body: Any) -> int:
+    """Number of log records in the request (validates the structure)."""
+    return sum(len(records) for _, records in _scope_record_lists(body))
 
-                # ── Body text ─────────────────────────────────────────────
-                body_val = lr.get("body", {})
-                if isinstance(body_val, dict):
-                    resolved = _resolve_any_value(body_val)
-                    body_str: str = str(resolved) if resolved is not None else ""
+
+class _ResourceView:
+    """Per-resource state shared by all its records (computed once)."""
+
+    def __init__(self, rl: dict) -> None:
+        resource_raw = rl.get("resource", {})
+        if not isinstance(resource_raw, dict):
+            resource_raw = {}
+        # _parse_attrs builds every attribute (bounded by the body size); the
+        # count limit applies after, and entity comes from ALL of them.
+        attrs = _parse_attrs(resource_raw.get("attributes", []))
+        self.entity = _extract_entity(attrs)[:_ENTITY_MAX_CHARS]
+        attrs, self.capped = _cap_attrs(attrs)
+        self.attrs = types.MappingProxyType(attrs)
+        self.costs = {k: _attr_cost(k, v) for k, v in attrs.items()}
+        self.total_cost = sum(self.costs.values())
+        # Records without own attributes that fit the budget share this mapping.
+        self.shared = types.MappingProxyType({**attrs, "entity": self.entity})
+        # Over-budget records without own attributes: kept attrs depend only on
+        # the body length left after truncation.
+        self._trimmed: Dict[int, Mapping[str, Any]] = {}
+
+    def trimmed(self, body_str: str, max_record_bytes: int) -> Tuple[str, Mapping[str, Any]]:
+        body_str, kept = _enforce_budget(body_str, self.attrs, max_record_bytes, self.costs)
+        key = len(body_str)
+        if key not in self._trimmed:
+            self._trimmed[key] = types.MappingProxyType({**kept, "entity": self.entity})
+        return body_str, self._trimmed[key]
+
+
+def _iter_log_records(
+    body: Any, max_record_bytes: int, *, skip: int
+) -> Iterator[Tuple[LogRecord, bool]]:
+    """Yield ``(record, was_truncated)`` in request order, after the first ``skip``.
+
+    Skipped records are only type-checked, so validation errors are the same
+    as for a full parse.
+    """
+    resource: Optional[_ResourceView] = None
+    current_rl: Optional[dict] = None
+
+    for rl, log_records_raw in _scope_record_lists(body):
+        for lr in log_records_raw:
+            if not isinstance(lr, dict):
+                raise ValueError(
+                    "OTLP body: each logRecords entry must be an object"
+                )
+            if skip > 0:
+                skip -= 1
+                continue
+            if rl is not current_rl:
+                resource, current_rl = _ResourceView(rl), rl
+
+            # ── Timestamp (clamped — never raises) ────────────────────────
+            timestamp = _parse_nano_to_iso(lr.get("timeUnixNano"))
+
+            # ── Body text ─────────────────────────────────────────────────
+            body_val = lr.get("body", {})
+            if isinstance(body_val, dict):
+                resolved = _resolve_any_value(body_val)
+                body_str: str = str(resolved) if resolved is not None else ""
+            else:
+                body_str = str(body_val) if body_val is not None else ""
+
+            # ── Severity text (optional) ───────────────────────────────────
+            sev_raw = lr.get("severityText")
+            severity: Optional[str] = str(sev_raw) if sev_raw is not None else None
+
+            # ── Attributes: resource merged with record-level ──────────────
+            # Resource attrs provide baseline; record-level attrs override.
+            # ``entity`` is budget-exempt, derived from resource attrs only,
+            # capped at _ENTITY_MAX_CHARS, and always set last (F5 note).
+            own, own_capped = _cap_attrs(_parse_attrs(lr.get("attributes", [])))
+            truncated = resource.capped or own_capped
+
+            if not own:
+                if len(body_str) + resource.total_cost <= max_record_bytes:
+                    attributes: Mapping[str, Any] = resource.shared
                 else:
-                    body_str = str(body_val) if body_val is not None else ""
-
-                # ── Severity text (optional) ───────────────────────────────
-                sev_raw = lr.get("severityText")
-                severity: Optional[str] = str(sev_raw) if sev_raw is not None else None
-
-                # ── Attributes: resource merged with record-level ──────────
-                # Resource attrs provide baseline; record-level attrs override.
-                # Note: ``entity`` is excluded here — it is re-attached AFTER
-                # budget enforcement so it survives truncation (see F5 note).
-                own_attrs, record_capped = _cap_attrs(_parse_attrs(lr.get("attributes", [])))
-                record_attrs: Dict[str, Any] = dict(resource_attrs)
-                record_attrs.update(own_attrs)
-                truncated = resource_capped or record_capped
-
-                # ── Budget enforcement (F5) ────────────────────────────────
-                # ``entity`` is budget-exempt and not present in record_attrs
-                # yet; it is added below after the budget is settled.
-                estimated = len(body_str) + sum(
-                    len(k) + len(str(v)) for k, v in record_attrs.items()
+                    body_str, attributes = resource.trimmed(body_str, max_record_bytes)
+                    truncated = True
+            else:
+                own_costs = {k: _attr_cost(k, v) for k, v in own.items()}
+                estimated = len(body_str) + resource.total_cost + sum(own_costs.values()) - sum(
+                    resource.costs[k] for k in own if k in resource.costs
                 )
                 if estimated > max_record_bytes:
-                    body_str, record_attrs = _enforce_budget(
-                        body_str, record_attrs, max_record_bytes
+                    merged = {**resource.attrs, **own}
+                    body_str, kept = _enforce_budget(
+                        body_str, merged, max_record_bytes,
+                        collections.ChainMap(own_costs, resource.costs),
                     )
+                    kept["entity"] = resource.entity
+                    attributes = types.MappingProxyType(kept)
                     truncated = True
+                else:
+                    own_layer = dict(own)
+                    own_layer["entity"] = resource.entity
+                    attributes = types.MappingProxyType(
+                        collections.ChainMap(own_layer, resource.attrs)
+                    )
 
-                # Re-attach entity AFTER budget enforcement (budget-exempt).
-                # Capped at _ENTITY_MAX_CHARS so a huge k8s.pod.name value
-                # cannot bypass max_record_bytes through the exemption.
-                # Not overridable by record-level attributes (derived from
-                # resource attrs only, enforced by setting here last).
-                record_attrs["entity"] = entity[:_ENTITY_MAX_CHARS]
-
-                yield LogRecord(
-                    timestamp=timestamp,
-                    body=body_str,
-                    severity=severity,
-                    attributes=record_attrs,
-                ), truncated
+            yield LogRecord(
+                timestamp=timestamp,
+                body=body_str,
+                severity=severity,
+                attributes=attributes,
+            ), truncated

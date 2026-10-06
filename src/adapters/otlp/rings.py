@@ -18,6 +18,8 @@ Clock domain
 Lock discipline (M9b reviewer audit)
   The ``threading.Lock`` guards ONLY these operations:
     - ``append``: ``popleft`` + ``_buf.append`` + counter increments
+    - ``ingest``: one batch — skipped/truncated counters + every append, so
+      readers never see a batch half applied
     - ``snapshot``: ``list(self._buf)``
     - ``note_truncated``: ``self._truncated_records += n``
     - ``covered_window``/``stats``: read of ``_dropped_oldest``,
@@ -137,18 +139,26 @@ class LogRing:
                 self._dropped_oldest += 1
             self._buf.append((recv_ts, record))
 
-    def note_dropped(self, n: int) -> None:
-        """Count ``n`` records as dropped without buffering them.
+    def ingest(
+        self, recv_ts: float, records: Any, *, skipped: int = 0, truncated: int = 0
+    ) -> None:
+        """Apply one received batch atomically.
 
-        The receiver skips the older records of a batch larger than the ring
-        (they would be evicted by the same batch anyway); counting them here
-        keeps ``dropped_oldest`` identical to appending and evicting them.
-        ``n <= 0`` is a no-op.
+        ``skipped`` older records of the batch were not built (the batch is
+        larger than the ring; they would be evicted by the same batch anyway)
+        and count as dropped, exactly as if appended and evicted.
+        ``truncated`` is added to the truncated-record counter. Everything
+        happens under one lock acquisition so a concurrent reader never sees
+        the drop counted but the new records missing.
         """
-        if n <= 0:
-            return
         with self._lock:
-            self._dropped_oldest += n
+            self._dropped_oldest += max(skipped, 0)
+            self._truncated_records += max(truncated, 0)
+            for record in records:
+                while len(self._buf) >= self._capacity:
+                    self._buf.popleft()
+                    self._dropped_oldest += 1
+                self._buf.append((recv_ts, record))
 
     def note_truncated(self, n: int) -> None:
         """Add ``n`` to the cumulative truncated-record counter.
