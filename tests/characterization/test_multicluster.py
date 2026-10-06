@@ -821,7 +821,7 @@ async def test_to_thread_detect_timeout_cancellable(server, monkeypatch):
     block_event = _threading.Event()
 
     class _BlockingApisApi:
-        def get_api_versions(self):
+        def get_api_versions(self, **kwargs):
             block_event.wait()  # hangs until finally-block sets the event
             return type("_V", (), {"groups": []})()
 
