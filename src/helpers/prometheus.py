@@ -1,6 +1,5 @@
 """Prometheus/Thanos discovery, query execution, and result formatting."""
 
-import re
 import os
 import time
 import logging
@@ -806,29 +805,27 @@ async def _process_prometheus_results(
     original_query: str,
     query_type: str
 ) -> Dict[str, Any]:
-    """Process and format Prometheus query results."""
+    """Process and format Prometheus query results.
+
+    Raises ValueError for a rejected namespace_filter (callers validate it
+    first); results are never returned unfiltered.
+    """
+    # Compiled outside the try below so a rejected filter cannot become an
+    # empty "success" result.
+    namespace_pattern = _safe_compile_namespace_filter(namespace_filter) if namespace_filter else None
     try:
         result_data = response_data.get("data", {})
         result_type = result_data.get("resultType", "")
         raw_results = result_data.get("result", [])
 
         # Apply namespace filtering if specified
-        if namespace_filter:
-            try:
-                namespace_pattern = _safe_compile_namespace_filter(namespace_filter)
-                filtered_results = []
-
-                for result in raw_results:
-                    metric = result.get("metric", {})
-                    namespace = metric.get("namespace", "")
-                    if namespace and namespace_pattern.search(namespace):
-                        filtered_results.append(result)
-
-                raw_results = filtered_results
-                logger.info(f"Applied namespace filter '{namespace_filter}', {len(raw_results)} results remain")
-
-            except (re.error, ValueError) as e:
-                logger.warning(f"Invalid namespace filter regex '{namespace_filter}': {e}")
+        if namespace_pattern is not None:
+            raw_results = [
+                result for result in raw_results
+                if (result.get("metric", {}).get("namespace") or "")
+                and namespace_pattern.search(result["metric"]["namespace"])
+            ]
+            logger.info(f"Applied namespace filter '{namespace_filter}', {len(raw_results)} results remain")
 
         # Apply limit if specified
         if limit and len(raw_results) > limit:
