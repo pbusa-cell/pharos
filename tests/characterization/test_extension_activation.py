@@ -107,7 +107,7 @@ def test_discover_api_groups_unit(server, monkeypatch):
     call_log: list[str] = []
 
     class FakeApisApi:
-        def get_api_versions(self_inner):  # noqa: N805
+        def get_api_versions(self_inner, **kwargs):  # noqa: N805
             call_log.append("get_api_versions")
             return fake_versions
 

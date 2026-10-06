@@ -15,9 +15,9 @@ Ratchet: the AST scan below must find, in any ``async def`` under src/:
   3. no ``asyncio.to_thread`` / ``run_in_executor`` of a Kubernetes method
      (or a lambda / getattr-method wrapping one) — that runs off the loop but
      with no request timeout and outside k8s_call's thread bound;
-  4. no direct call of a sync function or method of the same module that
-     makes Kubernetes calls (it blocks just like rule 1); run it with
-     ``k8s_offload``.
+  4. no direct call of a sync function or method anywhere in src/ that makes
+     Kubernetes calls (it blocks just like rule 1); run it with
+     ``k8s_offload``. Helpers are matched by name across modules.
 Calls inside nested sync functions are judged where those functions run.
 """
 import ast
@@ -35,7 +35,8 @@ sys.path.insert(0, str(SRC))
 from core import k8s_async  # noqa: E402
 from core.k8s_async import k8s_call  # noqa: E402
 
-_K8S_PREFIXES = ("list_", "read_", "get_namespaced_custom_object", "get_cluster_custom_object", "get_code")
+_K8S_PREFIXES = ("list_", "read_", "get_namespaced_custom_object", "get_cluster_custom_object", "get_code",
+                 "get_api_versions", "call_api")
 _NOT_K8S = {"list_models", "list_sources", "read_text", "read_bytes", "list_kube_config_contexts"}
 _OFFLOAD = {"to_thread", "run_in_executor"}
 
@@ -122,10 +123,12 @@ def _blocking_or_unbounded(fn: ast.AsyncFunctionDef, sync_k8s: dict):
 
 
 def test_no_direct_k8s_calls_in_async_functions():
+    trees = {path: ast.parse(path.read_text()) for path in sorted(SRC.rglob("*.py"))}
+    sync_k8s = {}
+    for tree in trees.values():
+        sync_k8s.update(_sync_k8s_functions(tree))
     hits = []
-    for path in sorted(SRC.rglob("*.py")):
-        tree = ast.parse(path.read_text())
-        sync_k8s = _sync_k8s_functions(tree)
+    for path, tree in trees.items():
         for fn in ast.walk(tree):
             if isinstance(fn, ast.AsyncFunctionDef):
                 for lineno, what in _blocking_or_unbounded(fn, sync_k8s):
@@ -254,7 +257,7 @@ def test_k8s_offload_runs_sync_helper_off_loop():
 
 
 def test_k8s_call_works_across_event_loops():
-    """The semaphore is per loop; a second asyncio.run must not reuse the first loop's."""
+    """The pool is process-wide; calls from a second event loop still work."""
     for _ in range(2):
         assert asyncio.run(k8s_call(lambda _request_timeout=None: 1)) == 1
 
@@ -271,6 +274,15 @@ def _hits(src):
     tree = ast.parse(src)
     fn = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef))
     return list(_blocking_or_unbounded(fn, _sync_k8s_functions(tree)))
+
+
+def test_sync_helper_rule_is_cross_module():
+    """Helpers are collected from all of src/, so a direct call from another module is caught."""
+    helper = ast.parse("def is_trusted(api, ns):\n    return api.read_namespace(ns)\n")
+    caller = ast.parse("async def discover(api):\n    if is_trusted(api, 'x'):\n        return 1\n")
+    fn = caller.body[0]
+    assert list(_blocking_or_unbounded(fn, _sync_k8s_functions(helper)))
+    assert not list(_blocking_or_unbounded(fn, _sync_k8s_functions(caller)))
 
 
 def test_scanner_rules():
