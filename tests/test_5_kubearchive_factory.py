@@ -28,8 +28,7 @@ Mutation check for BUG 2 (review B2):
 
 Mutation check for M1 (review round 2):
   Mutant: remove the `if not self._source:` guard at
-  kubearchive_integration.py:~202 (the one that gates _check_service and
-  _check_kubeconfig_route_inference).  Running this suite must cause
+  kubearchive_integration.py:~202 (the one that gates _check_service).  Running this suite must cause
   test_named_source_service_and_kubeconfig_steps_never_called to fail —
   confirming the seam test catches the regression.
 """
@@ -272,8 +271,8 @@ class TestDiscoveryEnvironmentIsolation:
         causes this test to fail — the env value ('https://ka.default.example.com')
         is returned instead of None.
 
-        The sub-discovery methods (_check_route, _check_ingress, _check_service,
-        _check_kubeconfig_route_inference) are stubbed to return None so that
+        The sub-discovery methods (_check_route, _check_ingress, _check_service)
+        are stubbed to return None so that
         only the env-gating seam is exercised.
         """
         monkeypatch.setenv("KUBEARCHIVE_HOST", "https://ka.default.example.com")
@@ -295,11 +294,6 @@ class TestDiscoveryEnvironmentIsolation:
         monkeypatch.setattr(ka.KubeArchiveEndpointDiscovery, "_check_route", stub_none)
         monkeypatch.setattr(ka.KubeArchiveEndpointDiscovery, "_check_ingress", stub_none)
         monkeypatch.setattr(ka.KubeArchiveEndpointDiscovery, "_check_service", stub_none)
-        monkeypatch.setattr(
-            ka.KubeArchiveEndpointDiscovery,
-            "_check_kubeconfig_route_inference",
-            stub_none,
-        )
 
         result = asyncio.run(d.discover_endpoint())
         assert result is None, (
@@ -313,8 +307,7 @@ class TestDiscoveryEnvironmentIsolation:
 # ─── 6. M1 spy: service and kubeconfig steps never called for named source ────
 
 class TestDiscoveryGatingSpyM1:
-    """M1 mutant kill: _check_service/_check_kubeconfig_route_inference must never
-    be called for a named source.
+    """M1 mutant kill: _check_service must never be called for a named source.
 
     Removing the `if not self._source:` guard at kubearchive_integration.py:~202
     must cause test_named_source_service_and_kubeconfig_steps_never_called to fail.
@@ -328,8 +321,7 @@ class TestDiscoveryGatingSpyM1:
     async def test_named_source_service_and_kubeconfig_steps_never_called(
         self, monkeypatch
     ):
-        """Spy: _check_service and _check_kubeconfig_route_inference must have
-        call_count == 0 after discover_endpoint() for a named source.
+        """Spy: _check_service must have call_count == 0 after discover_endpoint() for a named source.
 
         Mutant kill (M1): removing the `if not self._source:` guard at :~202
         makes _check_service reachable → spy fires → this test fails.
@@ -346,14 +338,9 @@ class TestDiscoveryGatingSpyM1:
         assert d is not None
 
         service_calls: list = []
-        kubeconfig_calls: list = []
 
         async def spy_check_service(self_):
             service_calls.append(1)
-            return None
-
-        async def spy_check_kubeconfig(self_):
-            kubeconfig_calls.append(1)
             return None
 
         # Stub _check_route and _check_ingress to return None so discover_endpoint
@@ -366,11 +353,6 @@ class TestDiscoveryGatingSpyM1:
         monkeypatch.setattr(
             ka.KubeArchiveEndpointDiscovery, "_check_service", spy_check_service
         )
-        monkeypatch.setattr(
-            ka.KubeArchiveEndpointDiscovery,
-            "_check_kubeconfig_route_inference",
-            spy_check_kubeconfig,
-        )
 
         result = await d.discover_endpoint()
 
@@ -378,11 +360,6 @@ class TestDiscoveryGatingSpyM1:
             f"_check_service must NOT be called for a named source; "
             f"got {len(service_calls)} call(s). "
             "Add `if not self._source:` guard before _check_service in discover_endpoint."
-        )
-        assert kubeconfig_calls == [], (
-            f"_check_kubeconfig_route_inference must NOT be called for a named source; "
-            f"got {len(kubeconfig_calls)} call(s). "
-            "Add `if not self._source:` guard before _check_kubeconfig_route_inference."
         )
         assert result is None
 
@@ -415,11 +392,6 @@ class TestDiscoveryGatingSpyM1:
         monkeypatch.setattr(ka.KubeArchiveEndpointDiscovery, "_check_ingress", stub_none)
         monkeypatch.setattr(
             ka.KubeArchiveEndpointDiscovery, "_check_service", spy_check_service
-        )
-        monkeypatch.setattr(
-            ka.KubeArchiveEndpointDiscovery,
-            "_check_kubeconfig_route_inference",
-            stub_none,
         )
 
         await d.discover_endpoint()

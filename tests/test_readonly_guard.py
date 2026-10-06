@@ -13,10 +13,10 @@ SCOPES = list((REPO / "src").rglob("*.py")) + [REPO / "main.py"]
 WRITE_RE = re.compile(r"\.(create_|patch_|delete_|replace_|connect_)[a-z_]+\(")
 
 # Allowlist: (relpath, substring) pairs — each exempts lines in the named file
-# that contain the given substring.  Three sites, two distinct pairs.
+# that contain the given substring.
 ALLOWLIST = [
     # stdlib TLS context construction, not a k8s write
-    ("src/helpers/kubearchive_integration.py", "ssl.create_default_context("),
+    ("src/core/tls.py", "ssl.create_default_context("),
     # local joblib model file delete — ml_persistence.py has ZERO k8s clients
     ("src/helpers/ml_persistence.py", "self.delete_model("),
 ]
@@ -110,7 +110,7 @@ def test_scan_source_collocated_write_still_caught():
     Mutation: revert _scan_source to whole-line exemption → this test fails.
     """
     result = _scan_source(
-        "src/helpers/kubearchive_integration.py",
+        "src/core/tls.py",
         "ctx = ssl.create_default_context(); self.core_v1.delete_namespaced_pod(a, b)\n",
     )
     assert result, (
@@ -122,11 +122,11 @@ def test_scan_source_collocated_write_still_caught():
 def test_scan_source_allowlist_site_still_exempt():
     """Unit: a standalone allowlisted call in the legitimate file produces no hit."""
     result = _scan_source(
-        "src/helpers/kubearchive_integration.py",
+        "src/core/tls.py",
         "ctx = ssl.create_default_context()\n",
     )
     assert not result, (
-        "_scan_source must not flag ssl.create_default_context() alone in kubearchive_integration.py"
+        "_scan_source must not flag ssl.create_default_context() alone in core/tls.py"
     )
 
 

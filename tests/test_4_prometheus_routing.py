@@ -186,7 +186,7 @@ class TestNamedSourceNeverConsultsDefaultChain:
     async def test_explicit_token_used_in_auth_header(self, monkeypatch):
         """The explicit bearer_token string appears in the Authorization header."""
         async def _fake_discover(*args, **kwargs):
-            return ("http://fake.example.com:9090", "prometheus")
+            return ("https://fake.example.com:9090", "prometheus")
         monkeypatch.setattr("helpers.prometheus._discover_prometheus_endpoint", _fake_discover)
 
         import aiohttp
@@ -308,7 +308,7 @@ class TestDefaultPathPreserved:
 
         # Patch discovery and aiohttp
         async def _fake_discover(*args, **kwargs):
-            return ("http://fake.example.com:9090", "prometheus")
+            return ("https://fake.example.com:9090", "prometheus")
         monkeypatch.setattr("helpers.prometheus._discover_prometheus_endpoint", _fake_discover)
 
         import aiohttp

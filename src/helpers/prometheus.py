@@ -7,7 +7,9 @@ import logging
 import aiohttp
 from typing import Dict, List, Optional, Any
 from kubernetes import client
+from core.namespace_trust import namespace_is_trusted
 from core.readonly_client import ReadOnlyK8sClient
+from core.tls import PLAIN_HTTP_TOKEN_HINT, TLS_HINT, bearer_token_allowed, client_ssl_context
 from helpers.utils import _safe_compile_namespace_filter, _is_running_in_cluster
 
 logger = logging.getLogger("lumino-mcp")
@@ -267,6 +269,38 @@ async def _discover_prometheus_via_routes(custom_api) -> Optional[str]:
     return None
 
 
+# Cluster-wide searches (label selectors, Prometheus CRs) accept only these
+# namespaces: anyone who can create a Service or CR in their own namespace
+# must not be able to choose the metrics endpoint. Names outside openshift-*
+# can be self-provisioned on OpenShift, so every match is also checked with
+# namespace_is_trusted. Prometheus in another namespace: set PROMETHEUS_URL /
+# THANOS_URL.
+TRUSTED_MONITORING_NAMESPACES = frozenset({
+    "openshift-monitoring",
+    "openshift-user-workload-monitoring",
+    "monitoring",
+    "prometheus",
+    "thanos",
+    "kube-prometheus",
+    "observability",
+})
+
+
+def _first_trusted_service(services, core_api):
+    """First service in a trusted monitoring namespace, or None."""
+    for service in services.items:
+        namespace = service.metadata.namespace
+        if namespace in TRUSTED_MONITORING_NAMESPACES:
+            if namespace_is_trusted(core_api, namespace):
+                return service
+            continue
+        logger.warning(
+            f"Ignoring Prometheus/Thanos service {service.metadata.namespace}/{service.metadata.name}: "
+            "namespace is not a trusted monitoring namespace (set PROMETHEUS_URL or THANOS_URL to use it)"
+        )
+    return None
+
+
 async def _discover_prometheus_via_operator_crd(custom_api, core_api) -> Optional[str]:
     """
     Discover Prometheus via Prometheus Operator CRDs.
@@ -295,6 +329,12 @@ async def _discover_prometheus_via_operator_crd(custom_api, core_api) -> Optiona
             namespace = metadata.get("namespace")
 
             if not name or not namespace:
+                continue
+            if namespace not in TRUSTED_MONITORING_NAMESPACES or not namespace_is_trusted(core_api, namespace):
+                logger.warning(
+                    f"Ignoring Prometheus CR {namespace}/{name}: namespace is not a trusted "
+                    "monitoring namespace (set PROMETHEUS_URL to use it)"
+                )
                 continue
 
             # The Prometheus Operator creates a service with pattern: prometheus-<name>
@@ -362,6 +402,8 @@ async def _discover_prometheus_via_services(core_api) -> Optional[str]:
         for namespace in monitoring_namespaces:
             try:
                 services = _ro.list_namespaced_service(namespace=namespace)
+                if not services.items or not namespace_is_trusted(core_api, namespace):
+                    continue
 
                 # Prioritize actual Prometheus server services (not alertmanager, pushgateway, etc.)
                 # Priority: prometheus-server > prometheus-k8s > prometheus > any with prometheus in name
@@ -409,7 +451,7 @@ async def _discover_prometheus_via_services(core_api) -> Optional[str]:
                     logger.debug(f"Namespace '{namespace}' not accessible: {e}")
                 continue
 
-        # Try cluster-wide search with label selectors
+        # Try cluster-wide search with label selectors (trusted namespaces only)
         label_selectors = [
             "app=prometheus",
             "app.kubernetes.io/name=prometheus",
@@ -422,8 +464,8 @@ async def _discover_prometheus_via_services(core_api) -> Optional[str]:
                     label_selector=label_selector
                 )
 
-                if services.items:
-                    service = services.items[0]  # Take first match
+                service = _first_trusted_service(services, core_api)
+                if service:
                     name = service.metadata.name
                     namespace = service.metadata.namespace
 
@@ -481,6 +523,8 @@ async def _discover_thanos_via_services(core_api) -> Optional[str]:
         for namespace in monitoring_namespaces:
             try:
                 services = _ro.list_namespaced_service(namespace=namespace)
+                if not services.items or not namespace_is_trusted(core_api, namespace):
+                    continue
 
                 for priority_name in priority_names:
                     for service in services.items:
@@ -514,7 +558,7 @@ async def _discover_thanos_via_services(core_api) -> Optional[str]:
                     logger.debug(f"Namespace '{namespace}' not accessible for Thanos discovery: {e}")
                 continue
 
-        # Cluster-wide label-based search
+        # Cluster-wide label-based search (trusted namespaces only)
         label_selectors = [
             "app.kubernetes.io/name=thanos-query",
             "app.kubernetes.io/component=query,app.kubernetes.io/name=thanos",
@@ -527,8 +571,8 @@ async def _discover_thanos_via_services(core_api) -> Optional[str]:
                 services = _ro.list_service_for_all_namespaces(
                     label_selector=label_selector
                 )
-                if services.items:
-                    service = services.items[0]
+                service = _first_trusted_service(services, core_api)
+                if service:
                     name = service.metadata.name
                     namespace = service.metadata.namespace
                     ports = service.spec.ports or []
@@ -720,11 +764,19 @@ async def _execute_prometheus_query_internal(
             "User-Agent": "Pharos/1.0"
         }
 
-        if auth_token:
+        # Never send the token in clear text: a discovered http:// service may
+        # be one any tenant can create.
+        token_withheld = bool(auth_token) and not bearer_token_allowed(query_url)
+        if token_withheld:
+            logger.warning(f"Not sending bearer token over plain http to {query_url}")
+        elif auth_token:
             headers["Authorization"] = f"Bearer {auth_token}"
 
+        ssl_context = client_ssl_context(host=prometheus_url)
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout + 10)) as session:
-            async with session.get(query_url, params=params, headers=headers, ssl=False) as response:
+            async with session.get(
+                query_url, params=params, headers=headers, ssl=ssl_context, allow_redirects=False
+            ) as response:
                 if response.status == 200:
                     response_data = await response.json()
                     result_data = response_data.get("data", {})
@@ -733,8 +785,14 @@ async def _execute_prometheus_query_internal(
                 else:
                     error_text = await response.text()
                     logger.warning(f"Prometheus query failed with status {response.status}: {error_text}")
-                    return {"success": False, "data": [], "endpoint_type": endpoint_type, "error": f"HTTP {response.status}: {error_text}"}
+                    error = f"HTTP {response.status}: {error_text}"
+                    if token_withheld and response.status in (401, 403):
+                        error = f"{error}. {PLAIN_HTTP_TOKEN_HINT}"
+                    return {"success": False, "data": [], "endpoint_type": endpoint_type, "error": error}
 
+    except aiohttp.ClientSSLError as e:
+        logger.error(f"TLS error executing internal Prometheus query: {e}")
+        return {"success": False, "data": [], "error": f"{e}. {TLS_HINT}"}
     except Exception as e:
         logger.error(f"Error executing internal Prometheus query: {e}")
         return {"success": False, "data": [], "error": str(e)}

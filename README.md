@@ -436,6 +436,8 @@ See also the transport env vars (`LUMINO_TRANSPORT`, `LUMINO_BIND_HOST`, `LUMINO
 | `PROMETHEUS_TOKEN` | Auto-detected | Bearer token for Prometheus/Thanos auth (checked first). |
 | `OPENSHIFT_TOKEN` | Auto-detected | OpenShift bearer token for Prometheus/Thanos (checked second). |
 | `OC_TOKEN` | Auto-detected | Last-resort token fallback for Prometheus/Thanos auth. |
+| `LUMINO_TLS_CA_BUNDLE` | *(none)* | PEM file of extra trusted CAs for Prometheus/Thanos and KubeArchive HTTPS (for example a cluster's self-signed ingress CA). Added to the system CAs, the `certifi` bundle and, in a pod, the OpenShift service CA. An unreadable path is an error. |
+| `LUMINO_TLS_INSECURE_SKIP_VERIFY` | `false` | Set to `true` to turn off certificate verification for Prometheus/Thanos and KubeArchive requests. Last resort: these requests carry your bearer token. Each use is logged as a warning. |
 | `LUMINO_STRICT_MODEL_LOADING` | `true` | ML model integrity enforcement. Set to `false` to allow loading unsigned legacy models (ml_persistence). |
 | `TOKENIZERS_PARALLELISM` | `false` (set by server) | HuggingFace tokenizers thread safety; the server sets this to `false` automatically when the optional `logan` pack loads. |
 | `LUMINO_DISABLE_TELEMETRY` | *(any value)* | **No-op.** This variable is not read by `src/` or `main.py`. It appears in test scrub lists for historical reasons only. |
@@ -522,15 +524,18 @@ KubeArchive stores Kubernetes resources off-cluster and provides a REST API for 
 
 ### Endpoint Auto-Discovery
 
-The endpoint is discovered automatically using a 5-step chain (first match wins):
+The endpoint is discovered automatically using a 4-step chain (first match wins):
 
 1. **`KUBEARCHIVE_HOST` environment variable** (highest priority)
-2. **OpenShift Route** named `kubearchive-api-server` in namespaces: `kubearchive`, `product-kubearchive`, `default`
+2. **OpenShift Route** named `kubearchive-api-server` in namespaces: `product-kubearchive`, `kubearchive`, `default`
 3. **Kubernetes Ingress** named `kubearchive-api-server` in the same namespaces
 4. **Kubernetes Service** named `kubearchive-api-server` (in-cluster DNS: `https://kubearchive-api-server.<namespace>.svc.cluster.local:<port>`)
-5. **Kubeconfig-based Route inference** -- constructs candidate URLs from the API server domain (pattern: `https://kubearchive-api-server-{namespace}.apps.{cluster-domain}`) and probes `/livez`
+
+Pharos does not guess route hostnames from the cluster domain: any project admin can claim such a hostname with a custom-host route. If Pharos cannot read the route, set `KUBEARCHIVE_HOST`.
 
 Results are cached at startup. On connection failure, the cache is cleared and re-probed on the next request.
+
+Steps 2 to 4 skip a namespace that Pharos cannot read or that is a self-provisioned OpenShift project (it has the `openshift.io/requester` annotation), because any user can create a project with a free name such as `kubearchive`. If KubeArchive runs in a namespace created with `oc new-project`, set `KUBEARCHIVE_HOST` (default source only; named sources have no override yet).
 
 ### Local Development (Port-Forwarding)
 
@@ -582,11 +587,13 @@ Auto-discovery order depends on runtime environment:
 
 **OpenShift Routes**: Searches the `openshift-monitoring` namespace. Prefers the `thanos-querier` route over `prometheus-k8s`. Falls back to any route with `prometheus` in the name. Detects protocol from TLS termination config.
 
-**Thanos Services**: Searches namespaces `openshift-monitoring`, `monitoring`, `thanos`, `observability`, `kube-prometheus`. Priority service names: `thanos-query-frontend`, `thanos-querier`, `thanos-query`. Also searches via label selectors: `app.kubernetes.io/name=thanos-query`, `app.kubernetes.io/component=query,app.kubernetes.io/name=thanos`, `app=thanos-query`, `app=thanos-querier`.
+**Thanos Services**: Searches namespaces `openshift-monitoring`, `monitoring`, `thanos`, `observability`, `kube-prometheus`. Priority service names: `thanos-query-frontend`, `thanos-querier`, `thanos-query`. Also searches via label selectors: `app.kubernetes.io/name=thanos-query`, `app.kubernetes.io/component=query,app.kubernetes.io/name=thanos`, `app=thanos-query`, `app=thanos-querier` (trusted namespaces only, see below).
 
-**Prometheus Services**: Searches namespaces `openshift-monitoring`, `monitoring`, `prometheus`, `kube-prometheus`, `observability`. Priority service names: `prometheus-server`, `prometheus-k8s`, `prometheus`. Also searches via label selectors: `app=prometheus`, `app.kubernetes.io/name=prometheus`, `app.kubernetes.io/component=prometheus`.
+**Prometheus Services**: Searches namespaces `openshift-monitoring`, `monitoring`, `prometheus`, `kube-prometheus`, `observability`. Priority service names: `prometheus-server`, `prometheus-k8s`, `prometheus`. Also searches via label selectors: `app=prometheus`, `app.kubernetes.io/name=prometheus`, `app.kubernetes.io/component=prometheus` (trusted namespaces only, see below).
 
-**Prometheus Operator CRD**: Discovers via `monitoring.coreos.com/v1` Prometheus custom resources and their associated services (pattern: `prometheus-{name}` in the same namespace).
+**Prometheus Operator CRD**: Discovers via `monitoring.coreos.com/v1` Prometheus custom resources and their associated services (pattern: `prometheus-{name}` in the same namespace). Only custom resources in trusted namespaces are used.
+
+**Trusted namespaces**: a namespace other than `default` and outside `openshift-*` / `kube-*` is used only if Pharos can read it and it is not a self-provisioned OpenShift project (no `openshift.io/requester` annotation). Label-selector and custom-resource matches are also accepted only in `openshift-monitoring`, `openshift-user-workload-monitoring`, `monitoring`, `prometheus`, `thanos`, `kube-prometheus` and `observability`. A Service or Prometheus resource in any other namespace is ignored (with a warning in the log). If your Prometheus or Thanos runs in another namespace, set `PROMETHEUS_URL` or `THANOS_URL`.
 
 ### Prometheus/Thanos Authentication
 
@@ -597,6 +604,13 @@ Authentication for Prometheus/Thanos uses the following 5 methods in priority or
 3. In-memory Kubernetes client config token
 4. ServiceAccount token file (`/var/run/secrets/kubernetes.io/serviceaccount/token`)
 5. Environment variables: `PROMETHEUS_TOKEN`, `OPENSHIFT_TOKEN`, `OC_TOKEN` (checked in that order)
+
+The token is sent only over HTTPS with certificate verification, or to a loopback host. It is never sent over plain `http` to another host, and redirects are not followed. If the endpoint uses a private CA, set `LUMINO_TLS_CA_BUNDLE`.
+
+Upgrade notes:
+
+- A `THANOS_URL`/`PROMETHEUS_URL` that uses `http://` with a non-loopback host no longer receives the token. If it needs authentication, use its `https` URL or a local port-forward.
+- KubeArchive always verifies TLS except on loopback. If Pharos cannot read the KubeArchive CA secret (for example `product-kubearchive` without RBAC for it), set `LUMINO_TLS_CA_BUNDLE` to that CA.
 
 ### Configuration Example
 
