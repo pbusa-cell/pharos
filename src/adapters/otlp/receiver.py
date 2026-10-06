@@ -22,7 +22,9 @@ Handler precedence (round-2 V2 — load-bearing order)
         Exception        → 400 (fixed literal)
   → parse try (json.loads + parse_export_logs_request):
         Exception        → 400 (fixed literal)
-  → ring.note_truncated(n) + ring.append(recv_ts, record) for each record
+  → ring.ingest(recv_ts, records, skipped=..., truncated=...) — one atomic
+    batch update (only the newest ring.capacity records of a batch are
+    built — C01)
   → 200 {}
 """
 from __future__ import annotations
@@ -36,7 +38,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from adapters.otlp.parse import parse_export_logs_request
+from adapters.otlp.parse import parse_newest_log_records
 from adapters.otlp.rings import LogRing
 from core.http_transport import BearerASGIMiddleware
 
@@ -200,13 +202,10 @@ def build_receiver_app(ring: LogRing, opts: dict, token: str | None):
         # ── parse + ingest — separate try block (F3 catch-all) ───────────────
         try:
             parsed = json.loads(body_bytes)
-            records, truncated = parse_export_logs_request(
-                parsed, max_record_bytes=max_record_bytes
+            records, truncated, skipped = parse_newest_log_records(
+                parsed, max_record_bytes=max_record_bytes, max_records=ring.capacity
             )
-            recv_ts = time.time()
-            ring.note_truncated(truncated)
-            for record in records:
-                ring.append(recv_ts, record)
+            ring.ingest(time.time(), records, skipped=skipped, truncated=truncated)
         except Exception:
             # RecursionError, TypeError, OverflowError, ValueError — none may
             # escape as 5xx (F3).  Fixed literal only — no str(exc) or payload.
