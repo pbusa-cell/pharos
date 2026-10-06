@@ -5,6 +5,7 @@ This module contains common utility functions used across multiple tools.
 """
 
 import ast
+import copy
 import os
 import re
 import json
@@ -263,6 +264,68 @@ def _strip_none_values(obj):
     elif isinstance(obj, list):
         return [_strip_none_values(item) for item in obj if item is not None]
     return obj
+
+
+# Secret annotations can hold the values themselves: client-side apply stores
+# the whole manifest in last-applied-configuration, and OpenShift dockercfg
+# Secrets carry the SA token in openshift.io/token-secret.value. Only these
+# known-safe annotations keep their values on a Secret; all others are redacted.
+_SAFE_SECRET_ANNOTATIONS = frozenset({
+    "kubernetes.io/service-account.name",
+    "kubernetes.io/service-account.uid",
+    "openshift.io/token-secret.name",
+})
+_SAFE_SECRET_ANNOTATION_PREFIXES = ("cert-manager.io/", "meta.helm.sh/")
+
+
+def _redact_secret_annotations(annotations: Dict[str, Any]) -> Dict[str, Any]:
+    """Return Secret annotations with every non-allowlisted value replaced by a marker."""
+    return {
+        key: value
+        if key in _SAFE_SECRET_ANNOTATIONS or key.startswith(_SAFE_SECRET_ANNOTATION_PREFIXES)
+        else "<redacted>"
+        for key, value in (annotations or {}).items()
+    }
+
+
+def _redacted_size(value: Any, is_base64: bool) -> str:
+    """Size marker for a redacted Secret value (decoded size for base64 data)."""
+    if value is None:
+        return "<redacted>"
+    raw = value.encode() if isinstance(value, str) else value
+    if is_base64:
+        try:
+            raw = base64.b64decode(raw, validate=True)
+        except Exception:
+            return "<redacted>"
+    return f"<redacted, {len(raw)} bytes>"
+
+
+def redact_secret(resource_obj: Any) -> Dict[str, Any]:
+    """Return a Secret as a new dict with every value replaced by a size marker.
+
+    Key names, type and metadata stay visible so the Secret can still be
+    inspected; data, string_data/stringData and non-allowlisted annotation
+    values are redacted. The input object is not modified.
+    """
+    if hasattr(resource_obj, 'to_dict'):
+        resource_dict = resource_obj.to_dict()
+    else:
+        resource_dict = copy.deepcopy(resource_obj)
+
+    for field in ('data', 'string_data', 'stringData'):
+        values = resource_dict.get(field)
+        if values:
+            resource_dict[field] = {
+                key: _redacted_size(value, is_base64=(field == 'data'))
+                for key, value in values.items()
+            }
+
+    metadata = resource_dict.get('metadata')
+    if metadata and metadata.get('annotations'):
+        metadata['annotations'] = _redact_secret_annotations(metadata['annotations'])
+
+    return resource_dict
 
 
 def format_yaml_output(resource_obj: Any, resource_type: str, name: str, namespace: str) -> str:
@@ -1957,6 +2020,10 @@ def extract_resource_info(resource: Dict[str, Any], include_spec: bool, include_
     api_version = resource.get("apiVersion") or resource.get("api_version") or _type_to_api_version.get(resource_type_hint, "Unknown")
     creation_ts = metadata.get("creationTimestamp") or metadata.get("creation_timestamp") or ""
     resource_version = metadata.get("resourceVersion") or metadata.get("resource_version") or ""
+    annotations = metadata.get("annotations") or {}
+    # List items carry no kind, so also check the (case-insensitive) type hint.
+    if kind == "Secret" or (resource_type_hint or "").lower() in ("secret", "secrets"):
+        annotations = _redact_secret_annotations(annotations)
 
     resource_info = {
         "kind": kind,
@@ -1965,7 +2032,7 @@ def extract_resource_info(resource: Dict[str, Any], include_spec: bool, include_
             "name": metadata.get("name") or "",
             "namespace": metadata.get("namespace") or "",
             "labels": metadata.get("labels") or {},
-            "annotations": metadata.get("annotations") or {},
+            "annotations": annotations,
             "creation_timestamp": creation_ts,
             "resource_version": resource_version,
             "uid": metadata.get("uid") or ""

@@ -716,6 +716,31 @@ def get_discovery(
 # KUBEARCHIVE API CLIENT
 # ============================================================================
 
+# Kubernetes name rules. namespace and name are interpolated into the request
+# path, so anything outside these sets ('/', '?', '#', '%', '..') could make the
+# request reach a different resource than the caller asked for.
+_DNS1123_LABEL = re.compile(r'[a-z0-9]([-a-z0-9]*[a-z0-9])?')
+_DNS1123_SUBDOMAIN = re.compile(r'[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*')
+
+
+def _validate_namespace(namespace: str) -> None:
+    """Raise ValueError unless namespace is a DNS-1123 label."""
+    if not isinstance(namespace, str) or len(namespace) > 63 or not _DNS1123_LABEL.fullmatch(namespace):
+        raise ValueError(f"Invalid namespace {namespace!r}: must be a DNS-1123 label")
+
+
+def _validate_name(name: str) -> None:
+    """Raise ValueError unless name is a DNS-1123 subdomain."""
+    if not isinstance(name, str) or len(name) > 253 or not _DNS1123_SUBDOMAIN.fullmatch(name):
+        raise ValueError(f"Invalid resource name {name!r}: must be a DNS-1123 subdomain")
+
+
+def _validate_resource_type(resource_type: str) -> None:
+    """Raise ValueError unless resource_type is plain lowercase letters."""
+    if not re.fullmatch(r'[a-z]+', resource_type):
+        raise ValueError(f"Invalid resource type {resource_type!r}")
+
+
 def _normalize_bearer_token(token: str) -> str:
     """Return a bare bearer token with no prefix and no surrounding whitespace.
 
@@ -1173,7 +1198,10 @@ class KubeArchiveClient:
             }
 
         # Build API URL based on resource type
-        url = self._build_resource_url(endpoint, resource_type, namespace, name)
+        try:
+            url = self._build_resource_url(endpoint, resource_type, namespace, name)
+        except ValueError as e:
+            return {'status': 'error', 'message': str(e)}
 
         # Build query parameters
         params = self._build_query_params(
@@ -1308,7 +1336,10 @@ class KubeArchiveClient:
             }
 
         # Build log URL
-        url = self._build_log_url(endpoint, resource_type, namespace, name)
+        try:
+            url = self._build_log_url(endpoint, resource_type, namespace, name)
+        except ValueError as e:
+            return {'status': 'error', 'message': str(e)}
         logger.debug(f"Requesting logs from: {url}")
 
         # Build query parameters
@@ -1394,6 +1425,7 @@ class KubeArchiveClient:
         resource_lower = resource_type.lower()
         if resource_lower not in resource_api_map:
             # Generic fallback - assume it's in core API
+            _validate_resource_type(resource_lower)
             api_path = 'api/v1'
             plural = resource_type.lower() + 's'
         else:
@@ -1404,10 +1436,12 @@ class KubeArchiveClient:
 
         # Build URL
         # Format: /apis/:group/:version/namespaces/:namespace/:resourceType[/:name]
+        _validate_namespace(namespace)
         url = f"{endpoint}/{api_path}/namespaces/{namespace}/{plural}"
 
         # Add name to path only if it's an exact match (no wildcards)
         if name and '*' not in name:
+            _validate_name(name)
             url = f"{url}/{name}"
 
         return url
@@ -1449,6 +1483,7 @@ class KubeArchiveClient:
         resource_lower = resource_type.lower()
         if resource_lower not in resource_api_map:
             # Generic fallback - assume it's in core API
+            _validate_resource_type(resource_lower)
             api_path = 'api/v1'
             plural = resource_type.lower() + 's'
         else:
@@ -1460,6 +1495,8 @@ class KubeArchiveClient:
         # Build log URL according to KubeArchive API spec
         # Format: /:group/:version/namespaces/:namespace/:resourceType/:name/log
         # Example: https://localhost:3100/apis/tekton.dev/v1/namespaces/my-ns/pipelineruns/my-pr/log
+        _validate_namespace(namespace)
+        _validate_name(name)
         url = f"{endpoint}/{api_path}/namespaces/{namespace}/{plural}/{name}/log"
         return url
 
