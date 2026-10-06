@@ -24,6 +24,7 @@ classifiers = [
 dependencies = [
     "aiohttp>=3.12.2",
     "certifi>=2024.2.2",  # trust store for token-bearing HTTPS requests (core/tls.py)
+    "google-re2>=1.1",  # linear-time matching for user-supplied namespace_filter (ReDoS)
     "kubernetes>=32.0.1",
     "mcp[cli]>=1.28.0,<2",  # hard dep on add_tool + send_tool_list_changed (consult R9); 2.0 removed mcp.server.fastmcp
     "pandas>=2.0.0",

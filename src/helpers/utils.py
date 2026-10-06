@@ -8,6 +8,7 @@ import ast
 import copy
 import os
 import re
+import re2
 import json
 import yaml
 import base64
@@ -3244,6 +3245,9 @@ async def _generate_synthetic_historical_data(duration_hours: int) -> Dict[str, 
 # Maximum allowed length for user-supplied regex patterns (namespace filters, etc.)
 _MAX_REGEX_PATTERN_LEN = 200
 
+# RE2 program memory limit for namespace filters (see _safe_compile_namespace_filter).
+_NAMESPACE_FILTER_MAX_MEM = 1 << 20
+
 # Detects nested quantifiers that cause catastrophic backtracking (ReDoS).
 # Catches patterns like (a+)+, (a*)+, (a+)*, ([^x]+)+, (?:a+)+, etc.
 # Also catches overlapping-alternation quantifiers like (a|aa)+, (x|xx|xxx)+.
@@ -3257,21 +3261,24 @@ _NESTED_QUANTIFIER_RE = re.compile(
 )
 
 
-def _safe_compile_namespace_filter(pattern: str) -> re.Pattern:
-    """Compile a namespace filter regex with ReDoS protections.
+def _safe_compile_namespace_filter(pattern: str) -> Any:
+    """Compile a user-supplied namespace filter with RE2 (linear-time matching).
 
-    Validates the pattern length and checks for nested quantifiers
-    that cause catastrophic backtracking before compiling.
+    Python's ``re`` backtracks, so patterns like ``(a+b?)+$`` or many ``.*``
+    can stall the event loop for minutes; no blacklist catches them all. RE2
+    guarantees time linear in the input. The length limit and the
+    nested-quantifier check stay as early, clear rejections.
 
     Args:
-        pattern: User-supplied regex pattern string.
+        pattern: User-supplied regex pattern string (RE2 syntax: no
+            backreferences or lookaround).
 
     Returns:
-        Compiled regex pattern.
+        Compiled RE2 pattern (supports ``.search(text)``).
 
     Raises:
-        ValueError: If the pattern is too long or contains dangerous constructs.
-        re.error: If the pattern is not valid regex syntax.
+        ValueError: If the pattern is too long, contains nested quantifiers,
+            or is not valid RE2 syntax.
     """
     if len(pattern) > _MAX_REGEX_PATTERN_LEN:
         raise ValueError(
@@ -3285,7 +3292,24 @@ def _safe_compile_namespace_filter(pattern: str) -> re.Pattern:
             "that may cause catastrophic backtracking (ReDoS)"
         )
 
-    return re.compile(pattern)
+    options = re2.Options()
+    options.log_errors = False  # no absl parse-error lines on stderr
+    # Namespace names are <= 63 chars; 1 MiB rejects patterns whose matching
+    # cost (linear, but proportional to program size) could still stall the
+    # loop over many namespaces, e.g. ".{1000}" * 12.
+    options.max_mem = _NAMESPACE_FILTER_MAX_MEM
+    try:
+        return re2.compile(pattern, options=options)
+    except re2.error as e:
+        detail = e.args[0].decode() if e.args and isinstance(e.args[0], bytes) else str(e)
+        if "too large" in detail:
+            raise ValueError(
+                f"Namespace filter is too complex: {detail}; use a simpler pattern"
+            ) from None
+        raise ValueError(
+            "Namespace filter is not a supported regular expression "
+            f"(RE2 syntax: no backreferences or lookaround): {detail}"
+        ) from None
 
 
 def _is_running_in_cluster() -> bool:

@@ -4868,6 +4868,28 @@ async def prometheus_query(
                 "errors": [f"Invalid query_type: {query_type}"]
             }
 
+        # Validate namespace_filter before querying: a rejected filter must
+        # never fall back to unfiltered, cluster-wide results.
+        if namespace_filter:
+            try:
+                _safe_compile_namespace_filter(namespace_filter)
+            except (re.error, ValueError) as e:
+                return {
+                    "status": "error",
+                    "error_type": "invalid_namespace_filter",
+                    "message": f"Invalid namespace_filter: {e}",
+                    "query_executed": query,
+                    "execution_time": 0,
+                    "result_count": 0,
+                    "data": [],
+                    "suggestions": [
+                        "Use RE2 syntax (no backreferences or lookaround), at most 200 characters",
+                        "Avoid nested quantifiers such as (a+)+",
+                        "Or filter in PromQL: {namespace=~\"team-.*\"}",
+                    ],
+                    "errors": [str(e)]
+                }
+
         # Validate range query parameters
         if query_type == "range":
             if not start_time or not end_time:
@@ -8529,6 +8551,20 @@ async def live_system_topology_mapper(
                 return _gate_err
     if _clients is None:
         _clients = _DefaultClientView()
+    # Validate namespace_filter before mapping: a rejected filter must never
+    # fall back to mapping every namespace.
+    namespace_pattern = None
+    if namespace_filter:
+        try:
+            namespace_pattern = _safe_compile_namespace_filter(namespace_filter)
+        except (re.error, ValueError) as e:
+            return {
+                "topology": {"nodes": [], "edges": []},
+                "summary": {"total_nodes": 0, "total_relationships": 0, "clusters_mapped": 0, "potential_blast_radius": {}},
+                "error": f"Invalid namespace_filter: {e}",
+                "error_type": "invalid_namespace_filter",
+                "last_updated": datetime.now().isoformat()
+            }
     try:
         logger.info(f"Starting live system topology mapping with filters: clusters={cluster_names}, "
                    f"types={component_types}, namespace_filter={namespace_filter}")
@@ -8584,13 +8620,9 @@ async def live_system_topology_mapper(
                     ns_list = await asyncio.to_thread(core_api.list_namespace)
                     all_namespaces = [ns.metadata.name for ns in ns_list.items]
 
-                    # Apply namespace filter if specified
-                    if namespace_filter:
-                        try:
-                            pattern = _safe_compile_namespace_filter(namespace_filter)
-                            all_namespaces = [ns for ns in all_namespaces if pattern.search(ns)]
-                        except (re.error, ValueError) as e:
-                            logger.warning(f"Invalid namespace filter regex '{namespace_filter}': {e}")
+                    # Apply namespace filter if specified (validated above)
+                    if namespace_pattern is not None:
+                        all_namespaces = [ns for ns in all_namespaces if namespace_pattern.search(ns)]
 
                 except Exception as e:
                     logger.warning(f"Failed to list namespaces in cluster {cluster_name}: {e}")
