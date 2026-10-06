@@ -191,7 +191,7 @@ async def test_discovery_write_back_after_disconnect_is_discarded(server, monkey
     gate = asyncio.Event()
 
     class _SlowApis:
-        def get_api_versions(self):
+        def get_api_versions(self, **kwargs):
             # runs in a worker thread; block until the disconnect happened
             import time
             while not gate.is_set():
@@ -238,7 +238,7 @@ async def test_connect_interrupted_by_disconnect_leaves_no_zombie(server, monkey
     monkeypatch.setattr(server, "_lumino_config", cfg)
 
     class _FakeApis:
-        def get_api_versions(self):
+        def get_api_versions(self, **kwargs):
             return SimpleNamespace(groups=[])
 
     def fake_build(context, kubeconfig_path=None):

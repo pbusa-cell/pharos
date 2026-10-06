@@ -10530,7 +10530,8 @@ async def _discover_api_groups(instance: str) -> frozenset:
     _discovery_call_count += 1
     view, _err = _resolve_k8s(instance)
     apis_api = view.apis_api
-    api_versions = await asyncio.to_thread(apis_api.get_api_versions)
+    # Callers wait at most ~2 s; the request timeout bounds the thread after that.
+    api_versions = await k8s_call(apis_api.get_api_versions, timeout=5)
     groups = frozenset(g.name for g in api_versions.groups)
     if instance not in _disconnected_instances:  # no write-back for a name disconnected mid-flight
         _discovery_cache[instance] = groups
