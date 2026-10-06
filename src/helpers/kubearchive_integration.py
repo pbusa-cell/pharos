@@ -15,7 +15,6 @@ import logging
 import aiohttp
 import ssl
 import base64
-import tempfile
 import subprocess
 import socket
 import yaml
@@ -23,15 +22,20 @@ from typing import Dict, List, Optional, Any, Tuple, Union
 from datetime import datetime
 from kubernetes import client
 from kubernetes.client.rest import ApiException
+from urllib.parse import urlparse
 
 logger = logging.getLogger("lumino-mcp.kubearchive")
 
 # Guarded import so helpers.kubearchive_integration is importable both at
 # runtime (src/ on path) and in isolated pytest collection (src/ not on path).
 try:
+    from core.namespace_trust import namespace_is_trusted
     from core.readonly_client import ReadOnlyK8sClient
+    from core.tls import TLS_HINT, bearer_token_allowed, client_ssl_context, is_loopback
 except ImportError:
+    from src.core.namespace_trust import namespace_is_trusted
     from src.core.readonly_client import ReadOnlyK8sClient
+    from src.core.tls import TLS_HINT, bearer_token_allowed, client_ssl_context, is_loopback
 
 # Global KubeArchive client instance (cached to avoid re-discovery)
 ka_client = None
@@ -163,7 +167,10 @@ class KubeArchiveEndpointDiscovery:
         self.k8s_networking_api = k8s_networking_api
         self._cached_endpoint: Optional[str] = None
         self._enabled = os.getenv('KUBEARCHIVE_ENABLED', 'true').lower() != 'false'
-        self._common_namespaces = ['kubearchive', 'product-kubearchive', 'default']
+        # product-kubearchive (Konflux) first. Any namespace outside openshift-*
+        # is checked with namespace_is_trusted before its route/ingress/service
+        # is used: KubeArchive requests carry the caller's token.
+        self._common_namespaces = ['product-kubearchive', 'kubearchive', 'default']
         self._auto_port_forward = auto_port_forward
         self._source = source  # "" = default; non-empty = named source (gates env/service/kubeconfig paths)
         self._port_forward_process: Optional[subprocess.Popen] = None
@@ -180,8 +187,10 @@ class KubeArchiveEndpointDiscovery:
         2. OpenShift Route (for OpenShift clusters)
         3. Kubernetes Ingress (for Kubernetes clusters)
         4. Kubernetes Service (fallback for both, uses in-cluster DNS)
-        5. Kubeconfig-based Route inference (constructs candidate URLs from
-           the cluster domain in the kubeconfig and probes them)
+
+        There is no guessing of route hostnames from the cluster domain: any
+        project admin can claim such a hostname with a custom-host route, and
+        the wildcard ingress certificate would make TLS verification pass.
 
         Args:
             force_refresh: Force re-discovery even if cached endpoint exists
@@ -259,13 +268,6 @@ class KubeArchiveEndpointDiscovery:
                 self._cached_endpoint = endpoint
                 return endpoint
 
-            # Step 5: Infer Route URL from kubeconfig cluster domain
-            endpoint = await self._check_kubeconfig_route_inference()
-            if endpoint:
-                logger.info(f"KubeArchive endpoint discovered via kubeconfig route inference: {endpoint}")
-                self._cached_endpoint = endpoint
-                return endpoint
-
         logger.warning("KubeArchive endpoint not found. Set KUBEARCHIVE_HOST or deploy kubearchive-api-server")
         return None
 
@@ -281,6 +283,9 @@ class KubeArchiveEndpointDiscovery:
                         plural='routes',
                         name='kubearchive-api-server'
                     )
+
+                    if not namespace_is_trusted(self.k8s_core_api, namespace):
+                        continue
 
                     # Extract host from route spec
                     host = route.get('spec', {}).get('host')
@@ -314,6 +319,9 @@ class KubeArchiveEndpointDiscovery:
                         name='kubearchive-api-server',
                         namespace=namespace
                     )
+
+                    if not namespace_is_trusted(self.k8s_core_api, namespace):
+                        continue
 
                     # Extract host from ingress rules
                     if ingress.spec and ingress.spec.rules:
@@ -351,122 +359,6 @@ class KubeArchiveEndpointDiscovery:
 
         return None
 
-    async def _check_kubeconfig_route_inference(self) -> Optional[str]:
-        """
-        Infer KubeArchive Route URLs from the kubeconfig cluster server URL.
-
-        On OpenShift, Routes follow a predictable pattern:
-            https://<route-name>-<namespace>.apps.<cluster-domain>
-
-        From an API server URL like https://api.cluster-foo.example.com:6443,
-        we extract the cluster domain (cluster-foo.example.com) and construct
-        candidate KubeArchive Route URLs for each namespace in
-        _common_namespaces.
-
-        Each candidate is probed with an HTTP health check (/livez) to verify
-        reachability before being returned.
-
-        Returns:
-            Reachable KubeArchive endpoint URL or None if no candidate is reachable.
-        """
-        try:
-            from kubernetes import config as k8s_config
-
-            # Load kubeconfig contexts to get the active cluster server URL
-            try:
-                contexts, active_context = k8s_config.list_kube_config_contexts()
-            except Exception as e:
-                logger.debug(f"Could not load kubeconfig contexts: {e}")
-                return None
-
-            if not active_context:
-                logger.debug("No active kubeconfig context found")
-                return None
-
-            cluster_name = active_context.get('context', {}).get('cluster')
-            if not cluster_name:
-                logger.debug("No cluster name in active kubeconfig context")
-                return None
-
-            # Load the kubeconfig file to extract the cluster server URL
-            kubeconfig_path = os.getenv('KUBECONFIG', os.path.expanduser('~/.kube/config'))
-            try:
-                with open(kubeconfig_path, 'r') as f:
-                    kubeconfig = yaml.safe_load(f)
-            except Exception as e:
-                logger.debug(f"Could not read kubeconfig file at {kubeconfig_path}: {e}")
-                return None
-
-            # Find the cluster entry matching the active context
-            server_url = None
-            for cluster_entry in kubeconfig.get('clusters', []):
-                if cluster_entry.get('name') == cluster_name:
-                    server_url = cluster_entry.get('cluster', {}).get('server')
-                    break
-
-            if not server_url:
-                logger.debug(f"No server URL found for cluster '{cluster_name}' in kubeconfig")
-                return None
-
-            logger.debug(f"Kubeconfig cluster server URL: {server_url}")
-
-            match = re.match(r'https?://api\.(.+?)(?::\d+)?/?$', server_url)
-            if not match:
-                logger.debug(
-                    f"API server URL '{server_url}' does not match expected "
-                    f"pattern 'https://api.<cluster-domain>:<port>'"
-                )
-                return None
-
-            cluster_domain = match.group(1)
-            logger.info(f"Extracted cluster domain from kubeconfig: {cluster_domain}")
-
-            # Construct candidate Route URLs for each namespace.
-            # OpenShift Route pattern: https://<route-name>-<namespace>.apps.<cluster-domain>
-            route_name = 'kubearchive-api-server'
-            candidates = []
-            for namespace in self._common_namespaces:
-                url = f"https://{route_name}-{namespace}.apps.{cluster_domain}"
-                candidates.append(url)
-
-            logger.info(
-                f"Probing {len(candidates)} candidate KubeArchive Route URLs "
-                f"inferred from kubeconfig"
-            )
-
-            # Probe each candidate with an HTTP health check
-            for candidate_url in candidates:
-                logger.debug(f"Probing candidate: {candidate_url}/livez")
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(
-                            f"{candidate_url}/livez",
-                            ssl=False,
-                            timeout=aiohttp.ClientTimeout(total=5),
-                        ) as response:
-                            if response.status == 200:
-                                logger.info(
-                                    f"Candidate reachable: {candidate_url} "
-                                    f"(status {response.status})"
-                                )
-                                return candidate_url
-                            else:
-                                logger.debug(
-                                    f"Candidate {candidate_url} returned "
-                                    f"status {response.status}"
-                                )
-                except aiohttp.ClientError as e:
-                    logger.debug(f"Candidate {candidate_url} unreachable: {e}")
-                except Exception as e:
-                    logger.debug(f"Error probing candidate {candidate_url}: {e}")
-
-            logger.debug("No inferred KubeArchive Route candidate was reachable")
-            return None
-
-        except Exception as e:
-            logger.debug(f"Error in kubeconfig-based route inference: {e}")
-            return None
-
     async def _check_service(self) -> Optional[str]:
         """Check for kubearchive-api-server Service in common namespaces."""
         try:
@@ -476,6 +368,9 @@ class KubeArchiveEndpointDiscovery:
                         name='kubearchive-api-server',
                         namespace=namespace
                     )
+
+                    if not namespace_is_trusted(self.k8s_core_api, namespace):
+                        continue
 
                     # Build service URL
                     # In-cluster access: https://kubearchive-api-server.<namespace>.svc.cluster.local:8081
@@ -741,6 +636,17 @@ def _validate_resource_type(resource_type: str) -> None:
         raise ValueError(f"Invalid resource type {resource_type!r}")
 
 
+_PLAIN_HTTP_REFUSED = (
+    "Refusing to send the bearer token over plain http to {endpoint}; "
+    "use an https KubeArchive endpoint"
+)
+
+
+def _with_tls_hint(e: Exception) -> str:
+    """Error text, plus the CA-bundle hint when TLS verification failed."""
+    return f"{e}. {TLS_HINT}" if isinstance(e, aiohttp.ClientSSLError) else str(e)
+
+
 def _normalize_bearer_token(token: str) -> str:
     """Return a bare bearer token with no prefix and no surrounding whitespace.
 
@@ -781,9 +687,9 @@ class KubeArchiveClient:
         self._auth_token = k8s_auth_token
         self.k8s_core_api = k8s_core_api
         self._source = source  # "" = default; non-empty = named (gates ambient fallbacks)
-        self._ssl_context: Optional[ssl.SSLContext] = None
-        self._ca_cert_path: Optional[str] = None
-        self._ca_namespaces = ['kubearchive', 'product-kubearchive', 'default']
+        self._ssl_context: Union[ssl.SSLContext, bool, None] = None
+        self._ssl_context_key: Optional[str] = None
+        self._ca_namespaces = ['product-kubearchive', 'kubearchive', 'default']
         self._ca_secret_names = ['kubearchive-ca', 'kubearchive-api-server-tls']
 
     async def _get_auth_token(self) -> Optional[str]:
@@ -985,72 +891,65 @@ class KubeArchiveClient:
 
     async def _get_ssl_context(self):
         """
-        Get or create SSL context with KubeArchive CA certificate.
+        SSL context for KubeArchive requests, which carry a bearer token.
 
-        Returns SSL context from:
-        1. Cached SSL context (if already created)
-        2. False for localhost/port-forward (ssl=False, --insecure)
-        3. System CA bundle for remote OpenShift routes (public certificates)
-        4. KubeArchive CA certificate from TLS secrets (self-signed certs)
-        5. False (disables SSL verification as fallback)
+        Verification is off (False) only for a loopback endpoint (this covers
+        the automatic port-forward, whose endpoint is always localhost) or when
+        LUMINO_TLS_INSECURE_SKIP_VERIFY is set. Every other case verifies:
+        with the KubeArchive CA from a TLS secret when one is readable
+        (kubearchive-ca, kubearchive-api-server-tls), otherwise with the shared
+        trust store from core.tls. There is no insecure fallback.
 
-        Searches for secrets:
-        - kubearchive-ca (standard deployment)
-        - kubearchive-api-server-tls (OpenShift Konflux)
-
-        Returns:
-            SSL context for TLS verification, or False to disable verification
+        The result is cached per endpoint so a decision made for a local tunnel
+        never applies to a remote endpoint found later. Raises ValueError when
+        LUMINO_TLS_CA_BUNDLE is set but cannot be loaded.
         """
-        # Return cached SSL context if available
-        if self._ssl_context is not None:
+        endpoint = await self.endpoint_discovery.discover_endpoint()
+        if self._ssl_context is not None and self._ssl_context_key == endpoint:
             return self._ssl_context
 
-        # Skip SSL verification entirely when using automatic port-forward
-        if hasattr(self.endpoint_discovery, '_port_forward_process') and \
-           self.endpoint_discovery._port_forward_process:
-            logger.info("Using automatic port-forward - disabling SSL verification (safe for local development)")
-            logger.debug("Traffic is encrypted by kubectl port-forward tunnel")
-            self._ssl_context = False
+        self._ssl_context = self._build_ssl_context(endpoint)
+        self._ssl_context_key = endpoint
+        return self._ssl_context
+
+    def _build_ssl_context(self, endpoint: Optional[str]):
+        # Do not trust _port_forward_process here: it stays set when kubectl
+        # exits at once, and discovery may then return a remote endpoint.
+        hostname = (urlparse(endpoint).hostname or '') if endpoint else ''
+        if endpoint and is_loopback(endpoint):
+            logger.info(f"Connecting to localhost ({hostname}) - disabling SSL verification")
             return False
 
-        # Check if connecting to localhost
-        endpoint = await self.endpoint_discovery.discover_endpoint()
-        if endpoint:
-            import urllib.parse
-            parsed = urllib.parse.urlparse(endpoint)
-            hostname = parsed.hostname or ''
-            if hostname.lower() in ('localhost', '127.0.0.1', '::1'):
-                logger.info(f"Connecting to localhost ({hostname}) - disabling SSL verification")
-                self._ssl_context = False
-                return False
+        # OpenShift routes are usually signed by a public CA
+        if '.apps.' in hostname.lower() or hostname.endswith('.openshiftapps.com'):
+            logger.info(f"Detected OpenShift route {hostname}; verifying with the system trust store")
+            return client_ssl_context(host=hostname)
 
-            # For OpenShift routes with public domains, use system CA bundle
-            # These are typically signed by public CAs (Let's Encrypt, DigiCert, etc.)
-            if '.apps.' in hostname.lower() or hostname.endswith('.openshiftapps.com'):
-                logger.info(f"Detected OpenShift route with public certificate: {hostname}")
-                logger.info("Using system CA bundle for SSL verification")
-                ssl_context = ssl.create_default_context()
-                self._ssl_context = ssl_context
-                return ssl_context
+        ca_pem = self._read_kubearchive_ca()
+        if ca_pem:
+            try:
+                return client_ssl_context(extra_ca_pem=ca_pem, host=hostname)
+            except ssl.SSLError as e:
+                logger.warning(f"KubeArchive CA from TLS secret is not valid PEM ({e}); using the system trust store")
 
-        # Try to get CA certificate from TLS secrets for self-signed certificates
+        logger.warning(
+            "KubeArchive CA secret not readable; verifying %s with the system trust store "
+            "(set LUMINO_TLS_CA_BUNDLE if the server uses a private CA)", hostname or "endpoint"
+        )
+        return client_ssl_context(host=hostname)
+
+    def _read_kubearchive_ca(self) -> Optional[str]:
+        """Return the KubeArchive CA (PEM) from a known TLS secret, or None."""
         if not self.k8s_core_api:
             logger.debug("CoreV1Api not available, cannot fetch CA certificate")
-            logger.warning("Falling back to insecure SSL (certificate verification disabled)")
-            self._ssl_context = False
-            return False
+            return None
 
         try:
-            # Build list of namespaces to search
-            # Include the discovered namespace from endpoint discovery
+            # Include the discovered namespace first (highest priority)
             namespaces_to_search = []
-
-            # Add the discovered namespace first (highest priority)
             if hasattr(self.endpoint_discovery, '_discovered_namespace') and \
                self.endpoint_discovery._discovered_namespace:
                 namespaces_to_search.append(self.endpoint_discovery._discovered_namespace)
-
-            # Add common namespaces
             for ns in self._ca_namespaces:
                 if ns not in namespaces_to_search:
                     namespaces_to_search.append(ns)
@@ -1061,107 +960,27 @@ class KubeArchiveClient:
             # access .api_client — MUST-NEVER-WRAP on this class.
             _ro = ReadOnlyK8sClient.wrap(self.k8s_core_api)
 
-            # Try to find TLS secret in namespaces
             for namespace in namespaces_to_search:
+                if not namespace_is_trusted(self.k8s_core_api, namespace):
+                    continue
                 for secret_name in self._ca_secret_names:
                     try:
-                        secret = _ro.read_namespaced_secret(
-                            name=secret_name,
-                            namespace=namespace
-                        )
-
-                        # Try multiple certificate keys (different secret formats)
-                        cert_data = None
-                        cert_key = None
-
-                        if secret.data:
-                            # Try ca.crt first (standard CA cert)
-                            if 'ca.crt' in secret.data:
-                                cert_data = secret.data['ca.crt']
-                                cert_key = 'ca.crt'
-                            # Try tls.crt (server cert, can be used for verification)
-                            elif 'tls.crt' in secret.data:
-                                cert_data = secret.data['tls.crt']
-                                cert_key = 'tls.crt'
-                            # Try ca-bundle.crt (some deployments use this)
-                            elif 'ca-bundle.crt' in secret.data:
-                                cert_data = secret.data['ca-bundle.crt']
-                                cert_key = 'ca-bundle.crt'
-
-                        if cert_data:
-                            ca_cert = base64.b64decode(cert_data).decode('utf-8')
-
-                            # Write CA cert to temporary file
-                            # We need to keep this file around for the lifetime of the client
-                            if not self._ca_cert_path:
-                                # Create a named temporary file that we don't delete
-                                with tempfile.NamedTemporaryFile(mode='w', suffix='.crt', delete=False) as f:
-                                    f.write(ca_cert)
-                                    self._ca_cert_path = f.name
-
-                            # Create SSL context with the CA certificate
-                            ssl_context = ssl.create_default_context(cafile=self._ca_cert_path)
-
-                            # Check if we need to disable hostname verification
-                            # This is needed when:
-                            # 1. Using automatic port-forward (_port_forward_process is set)
-                            # 2. Connecting via localhost (manual port-forward or KUBEARCHIVE_HOST=localhost)
-                            # 3. Connecting via 127.0.0.1
-                            disable_hostname_check = False
-
-                            # Check for automatic port-forward
-                            if hasattr(self.endpoint_discovery, '_port_forward_process') and \
-                               self.endpoint_discovery._port_forward_process:
-                                disable_hostname_check = True
-                                logger.debug("Detected automatic port-forward")
-
-                            # Check if endpoint is localhost or 127.0.0.1
-                            try:
-                                endpoint = await self.endpoint_discovery.discover_endpoint()
-                                if endpoint:
-                                    import urllib.parse
-                                    parsed = urllib.parse.urlparse(endpoint)
-                                    hostname = parsed.hostname or ''
-                                    if hostname.lower() in ('localhost', '127.0.0.1', '::1'):
-                                        disable_hostname_check = True
-                                        logger.debug(f"Detected localhost endpoint: {hostname}")
-                            except:
-                                pass  # If we can't get endpoint, continue with current setting
-
-                            if disable_hostname_check:
-                                ssl_context.check_hostname = False
-                                logger.info("Disabled hostname verification for localhost/port-forward connection")
-                                logger.debug("Certificate verification is still active via CA certificate")
-
-                            self._ssl_context = ssl_context
-
-                            logger.info(f"Created SSL context with certificate from {namespace}/{secret_name}[{cert_key}]")
-                            return ssl_context
-
+                        secret = _ro.read_namespaced_secret(name=secret_name, namespace=namespace)
                     except ApiException as e:
-                        if e.status == 404:
-                            continue  # Try next secret/namespace
-                        logger.debug(f"Error reading {secret_name} secret in {namespace}: {e}")
+                        if e.status != 404:
+                            logger.debug(f"Error reading {secret_name} secret in {namespace}: {e}")
                         continue
 
+                    # ca.crt (standard), tls.crt (server cert), ca-bundle.crt
+                    for cert_key in ('ca.crt', 'tls.crt', 'ca-bundle.crt'):
+                        if secret.data and cert_key in secret.data:
+                            logger.info(f"Using KubeArchive CA from {namespace}/{secret_name}[{cert_key}]")
+                            return base64.b64decode(secret.data[cert_key]).decode('utf-8')
+
             logger.warning(f"TLS secrets not found. Searched for {self._ca_secret_names} in namespaces: {namespaces_to_search}")
-            logger.warning("Falling back to insecure SSL (certificate verification disabled)")
-            self._ssl_context = False
-            return False
-
         except Exception as e:
-            logger.warning(f"Error creating SSL context from TLS secrets: {e}")
-            logger.warning("Falling back to insecure SSL (certificate verification disabled)")
-            self._ssl_context = False
-            return False
-
-    def __del__(self):
-        """Cleanup: remove temporary CA certificate file."""
-        if self._ca_cert_path and os.path.exists(self._ca_cert_path):
-            try:
-                os.unlink(self._ca_cert_path)
-            except Exception as e:
-                logger.debug(f"Error removing temporary CA cert file: {e}")
+            logger.warning(f"Error reading KubeArchive CA from TLS secrets: {e}")
+        return None
 
     async def query_resources(
         self,
@@ -1202,6 +1021,8 @@ class KubeArchiveClient:
             url = self._build_resource_url(endpoint, resource_type, namespace, name)
         except ValueError as e:
             return {'status': 'error', 'message': str(e)}
+        if not bearer_token_allowed(url):
+            return {'status': 'error', 'message': _PLAIN_HTTP_REFUSED.format(endpoint=endpoint)}
 
         # Build query parameters
         params = self._build_query_params(
@@ -1229,11 +1050,16 @@ class KubeArchiveClient:
         }
 
         # Get SSL context for TLS verification
-        ssl_context = await self._get_ssl_context()
+        try:
+            ssl_context = await self._get_ssl_context()
+        except ValueError as e:
+            return {'status': 'error', 'message': str(e)}
 
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=headers, params=params, ssl=ssl_context) as response:
+                async with session.get(
+                    url, headers=headers, params=params, ssl=ssl_context, allow_redirects=False
+                ) as response:
                     if response.status == 200:
                         # Check content type
                         content_type = response.headers.get('Content-Type', '')
@@ -1288,7 +1114,7 @@ class KubeArchiveClient:
             self.endpoint_discovery.clear_cache()
             return {
                 'status': 'error',
-                'message': f'Error connecting to KubeArchive: {str(e)}'
+                'message': f'Error connecting to KubeArchive: {_with_tls_hint(e)}'
             }
         except Exception as e:
             logger.error(f"Unexpected error querying KubeArchive: {e}")
@@ -1340,6 +1166,8 @@ class KubeArchiveClient:
             url = self._build_log_url(endpoint, resource_type, namespace, name)
         except ValueError as e:
             return {'status': 'error', 'message': str(e)}
+        if not bearer_token_allowed(url):
+            return {'status': 'error', 'message': _PLAIN_HTTP_REFUSED.format(endpoint=endpoint)}
         logger.debug(f"Requesting logs from: {url}")
 
         # Build query parameters
@@ -1363,11 +1191,16 @@ class KubeArchiveClient:
         }
 
         # Get SSL context for TLS verification
-        ssl_context = await self._get_ssl_context()
+        try:
+            ssl_context = await self._get_ssl_context()
+        except ValueError as e:
+            return {'status': 'error', 'message': str(e)}
 
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=headers, params=params, ssl=ssl_context) as response:
+                async with session.get(
+                    url, headers=headers, params=params, ssl=ssl_context, allow_redirects=False
+                ) as response:
                     if response.status == 200:
                         logs = await response.text()
                         logger.info(f"Successfully retrieved {len(logs)/1.3} tokens of logs for {resource_type}/{name}")
@@ -1396,7 +1229,7 @@ class KubeArchiveClient:
             logger.error(f"Error retrieving logs from KubeArchive: {e}")
             return {
                 'status': 'error',
-                'message': f'Error connecting to KubeArchive: {str(e)}'
+                'message': f'Error connecting to KubeArchive: {_with_tls_hint(e)}'
             }
         except Exception as e:
             logger.error(f"Unexpected error retrieving logs: {e}")

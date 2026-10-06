@@ -177,6 +177,7 @@ from helpers import (
 )
 
 from core.readonly_client import ReadOnlyCoreV1, ReadOnlyK8sClient
+from core.tls import PLAIN_HTTP_TOKEN_HINT, TLS_HINT, bearer_token_allowed, client_ssl_context
 from core.config import load_config
 from core.registry import build_registry, SourceEntry, ADAPTER_CAPABILITIES as _ADAPTER_CAPABILITIES
 from core.selector import make_capability_error, Entity, TimeWindow, Limit
@@ -4954,15 +4955,22 @@ async def prometheus_query(
             "Accept": "application/json",
             "User-Agent": "Pharos/1.0"
         }
-        # Only add Authorization header if token is available
-        if auth_token:
+        # Only add Authorization header if token is available, and never in
+        # clear text: a discovered http:// service may be one any tenant can create.
+        token_withheld = bool(auth_token) and not bearer_token_allowed(query_url)
+        if token_withheld:
+            logger.warning(f"[{tool_name}] Not sending bearer token over plain http to {query_url}")
+        elif auth_token:
             headers["Authorization"] = f"Bearer {auth_token}"
 
         logger.info(f"[{tool_name}] Executing query against: {query_url}")
 
         # Execute Prometheus query
+        ssl_context = client_ssl_context(host=prometheus_url)
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout + 10)) as session:
-            async with session.get(query_url, params=params, headers=headers, ssl=False) as response:
+            async with session.get(
+                query_url, params=params, headers=headers, ssl=ssl_context, allow_redirects=False
+            ) as response:
                 execution_time = round((time.time() - start_execution_time) * 1000, 2)
 
                 if response.status == 200:
@@ -5016,7 +5024,7 @@ async def prometheus_query(
                         "execution_time": execution_time,
                         "result_count": 0,
                         "data": [],
-                        "suggestions": [
+                        "suggestions": ([PLAIN_HTTP_TOKEN_HINT] if token_withheld else []) + [
                             "Refresh your Kubernetes credentials (kubeconfig or ServiceAccount)",
                             "Check if token has expired",
                             "Set PROMETHEUS_TOKEN environment variable with a valid token",
@@ -5035,7 +5043,7 @@ async def prometheus_query(
                         "execution_time": execution_time,
                         "result_count": 0,
                         "data": [],
-                        "suggestions": [
+                        "suggestions": ([PLAIN_HTTP_TOKEN_HINT] if token_withheld else []) + [
                             "Check RBAC permissions for metrics access",
                             "Verify cluster-monitoring-view role binding",
                             "Contact cluster administrator for monitoring access"
@@ -5079,6 +5087,21 @@ async def prometheus_query(
                 "Use more specific label selectors to reduce data"
             ],
             "errors": [f"Timeout after {timeout}s"]
+        }
+
+    except aiohttp.ClientSSLError as e:
+        execution_time = round((time.time() - start_execution_time) * 1000, 2)
+        logger.error(f"[{tool_name}] TLS verification failed: {e}")
+        return {
+            "status": "error",
+            "error_type": "tls_verification_failed",
+            "message": f"TLS verification failed for the Prometheus endpoint: {e}",
+            "query_executed": query,
+            "execution_time": execution_time,
+            "result_count": 0,
+            "data": [],
+            "suggestions": [TLS_HINT],
+            "errors": [str(e)]
         }
 
     except Exception as e:

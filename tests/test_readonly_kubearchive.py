@@ -61,7 +61,7 @@ async def test_ssl_context_read_routes_readonly(monkeypatch):
     client.k8s_core_api = MagicMock()
     client.k8s_core_api.read_namespaced_secret.side_effect = Exception("no secret")
     client._ssl_context = None
-    client._ca_cert_path = None
+    client._ssl_context_key = None
     client._ca_namespaces = ["kubearchive"]
     client._ca_secret_names = ["kubearchive-ca"]
     disco = MagicMock()
