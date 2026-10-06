@@ -21,6 +21,7 @@ from collections import Counter, defaultdict
 
 from kubernetes.client.rest import ApiException
 from helpers.utils import get_all_pod_logs, calculate_context_tokens, normalize_pod_log_text, clean_etcd_logs
+from core.k8s_async import LOG_TIMEOUT, k8s_call
 from core.readonly_client import ReadOnlyCoreV1
 
 logger = logging.getLogger("lumino-mcp")
@@ -1878,7 +1879,7 @@ async def _prioritize_pipeline_pods(pod_names: List[str], namespace: str, core_a
 
         for pod_name in pod_names:
             try:
-                pod = _ro.read_namespaced_pod(name=pod_name, namespace=namespace)
+                pod = await k8s_call(_ro.read_namespaced_pod, name=pod_name, namespace=namespace)
 
                 priority_score = 0
 
@@ -2057,7 +2058,8 @@ def _get_logs_with_k8s_client(
             - tail_lines: Number of lines from end of logs
             - since_seconds: Logs newer than this many seconds
             - since_time: Logs newer than this RFC3339 timestamp
-            - follow: Stream logs in real-time
+            - follow: ignored; logs are always read as a snapshot (a
+              streaming read never returns and pins a worker thread)
             - timestamps: Include timestamps in output
             - previous: Get logs from previous container instance
 
@@ -2077,7 +2079,7 @@ def _get_logs_with_k8s_client(
                 'namespace': namespace,
                 'container': container_name,
                 'timestamps': log_params.get('timestamps', True),
-                'follow': log_params.get('follow', False),
+                'follow': False,
                 'previous': log_params.get('previous', False)
             }
 
@@ -2102,7 +2104,7 @@ def _get_logs_with_k8s_client(
             log_kwargs = {k: v for k, v in log_kwargs.items() if v is not None}
 
             log_content = normalize_pod_log_text(
-                k8s_core_api.read_namespaced_pod_log(**log_kwargs))
+                k8s_core_api.read_namespaced_pod_log(**log_kwargs, _request_timeout=LOG_TIMEOUT))
 
             if log_content:
                 # Clean etcd logs if this is an etcd container and cleaning is enabled

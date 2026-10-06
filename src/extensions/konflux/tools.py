@@ -37,6 +37,12 @@ from .lineage import (
 
 logger = logging.getLogger("lumino-mcp")
 
+# Overall time limits (seconds) for the two fan-out stages of one
+# pipeline_tracer call (C07), so a slow or hung apiserver cannot keep a trace
+# running indefinitely; each Kubernetes request also has its own timeout.
+TRACE_CORRELATE_TIMEOUT = 120.0
+TRACE_LIFECYCLE_TIMEOUT = 120.0
+
 
 def make_ci_cd_performance_baselining_tool(reg):
     async def ci_cd_performance_baselining_tool(
@@ -692,17 +698,28 @@ def make_pipeline_tracer(reg):
                     logger.debug(f"Failed to detect tekton namespaces: {e}")
 
             # Correlate pipeline events across clusters (parallelized)
-            pipeline_flow = await correlate_pipeline_events(
-                trace_identifier=trace_identifier,
-                trace_type=trace_type,
-                cluster_clients=cluster_clients,
-                start_time=start_time,
-                end_time=end_time,
-                namespaces=namespaces,
-                max_namespaces=max_namespaces,
-                tekton_namespaces=tekton_ns_list,
-                logger=logger
-            )
+            trace_warnings: List[str] = []
+            correlation_timed_out = False
+            try:
+                pipeline_flow = await asyncio.wait_for(correlate_pipeline_events(
+                    trace_identifier=trace_identifier,
+                    trace_type=trace_type,
+                    cluster_clients=cluster_clients,
+                    start_time=start_time,
+                    end_time=end_time,
+                    namespaces=namespaces,
+                    max_namespaces=max_namespaces,
+                    tekton_namespaces=tekton_ns_list,
+                    logger=logger
+                ), timeout=TRACE_CORRELATE_TIMEOUT)
+            except asyncio.TimeoutError:
+                pipeline_flow = []
+                correlation_timed_out = True
+                trace_warnings.append(
+                    f"Pipeline correlation timed out after {TRACE_CORRELATE_TIMEOUT:.0f}s; "
+                    "pass namespaces= or a lower max_namespaces to narrow the search"
+                )
+                logger.warning(trace_warnings[-1])
 
             # KubeArchive fallback (live finding 2026-08-20): prod Tekton GC
             # prunes PLRs within ~2h, so live-only correlation misses runs that
@@ -711,8 +728,12 @@ def make_pipeline_tracer(reg):
             # nothing (cost control: one archive HTTP query per namespace).
             # Best-effort: an unreachable archive never breaks the live trace.
             try:
-                archive_namespaces = list(namespaces) if namespaces else (
-                    (tekton_ns_list or [])[:max_namespaces] if not pipeline_flow else []
+                # After a correlation timeout the apiserver is slow; do not
+                # start the archive dredge on top of it.
+                archive_namespaces = [] if correlation_timed_out else (
+                    list(namespaces) if namespaces else (
+                        (tekton_ns_list or [])[:max_namespaces] if not pipeline_flow else []
+                    )
                 )
                 if archive_namespaces:
                     # Exact label-selector queries whenever the trace type maps to
@@ -795,13 +816,13 @@ def make_pipeline_tracer(reg):
             lifecycle = {}
             if pipeline_flow:
                 try:
-                    lifecycle = await follow_lifecycle_chain(
+                    lifecycle = await asyncio.wait_for(follow_lifecycle_chain(
                         pipeline_flow=pipeline_flow,
                         custom_api=ireg.k8s_custom_api,
                         core_api=ireg.k8s_core_api,
                         trace_depth=trace_depth,
                         logger=logger
-                    )
+                    ), timeout=TRACE_LIFECYCLE_TIMEOUT)
                     logger.info(
                         f"Lifecycle chain: {len(lifecycle.get('snapshots', []))} snapshots, "
                         f"{len(lifecycle.get('integration_tests', []))} tests, "
@@ -809,6 +830,10 @@ def make_pipeline_tracer(reg):
                         f"{len(lifecycle.get('release_pipelines', []))} release PLRs, "
                         f"{len(lifecycle.get('nudge_cascade', []))} nudge cascades"
                     )
+                except asyncio.TimeoutError:
+                    lifecycle = {"error": f"lifecycle chain timed out after {TRACE_LIFECYCLE_TIMEOUT:.0f}s"}
+                    trace_warnings.append(lifecycle["error"])
+                    logger.warning(lifecycle["error"])
                 except Exception as e:
                     logger.warning(f"Failed to follow lifecycle chain: {e}")
                     lifecycle = {"error": str(e)[:200]}
@@ -834,6 +859,8 @@ def make_pipeline_tracer(reg):
                 "bottlenecks": bottlenecks,
                 "summary": summary
             }
+            if trace_warnings:
+                result["warnings"] = trace_warnings
 
             logger.info(f"Trace completed: found {len(pipeline_flow)} pipelines across {summary['clusters_traversed']} clusters")
 

@@ -7,7 +7,6 @@
 # ============================================================================
 
 import re
-import asyncio
 import logging
 import statistics
 from datetime import datetime, timedelta
@@ -18,6 +17,7 @@ from collections import Counter, defaultdict
 from kubernetes.client.rest import ApiException
 
 from helpers.utils import parse_time_period
+from core.k8s_async import k8s_call
 from core.readonly_client import ReadOnlyCoreV1
 from .constants import SMART_EVENTS_CONFIG
 
@@ -2507,7 +2507,7 @@ async def _get_namespace_events_internal(
         while page_count < MAX_PAGES:
             try:
                 if continue_token:
-                    event_list_response = await asyncio.to_thread(
+                    event_list_response = await k8s_call(
                         _ro.list_namespaced_event,
                         namespace=namespace,
                         watch=False,
@@ -2515,7 +2515,7 @@ async def _get_namespace_events_internal(
                         _continue=continue_token
                     )
                 else:
-                    event_list_response = await asyncio.to_thread(
+                    event_list_response = await k8s_call(
                         _ro.list_namespaced_event,
                         namespace=namespace,
                         watch=False,
@@ -2668,7 +2668,7 @@ async def _get_namespace_events_as_dicts(
 
         # Fetch events
         _ro = ReadOnlyCoreV1.wrap(_c.core_api)
-        event_list_response = await asyncio.to_thread(
+        event_list_response = await k8s_call(
             _ro.list_namespaced_event,
             namespace=namespace,
             watch=False,

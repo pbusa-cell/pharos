@@ -70,7 +70,7 @@ def _fake_etcd_api(log_content: str):
     """
     class _FakeApi:
         def list_namespaced_pod(self, namespace, label_selector=None,
-                                timeout_seconds=None):
+                                timeout_seconds=None, **kwargs):
             if namespace == "openshift-etcd":
                 return _items_list([_pod("etcd-node-1", "openshift-etcd")])
             return _items_list([])

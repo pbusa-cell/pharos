@@ -29,10 +29,12 @@ logger = logging.getLogger("lumino-mcp.kubearchive")
 # Guarded import so helpers.kubearchive_integration is importable both at
 # runtime (src/ on path) and in isolated pytest collection (src/ not on path).
 try:
+    from core.k8s_async import DEFAULT_TIMEOUT, k8s_call, k8s_offload
     from core.namespace_trust import namespace_is_trusted
     from core.readonly_client import ReadOnlyK8sClient
     from core.tls import TLS_HINT, bearer_token_allowed, client_ssl_context, is_loopback
 except ImportError:
+    from src.core.k8s_async import DEFAULT_TIMEOUT, k8s_call, k8s_offload
     from src.core.namespace_trust import namespace_is_trusted
     from src.core.readonly_client import ReadOnlyK8sClient
     from src.core.tls import TLS_HINT, bearer_token_allowed, client_ssl_context, is_loopback
@@ -214,7 +216,7 @@ class KubeArchiveEndpointDiscovery:
             logger.info("Running locally (outside cluster)")
 
         # Detect platform type
-        is_openshift = self._is_openshift_cluster()
+        is_openshift = await k8s_offload(self._is_openshift_cluster)
         if is_openshift:
             logger.info("Detected OpenShift platform")
         else:
@@ -276,7 +278,7 @@ class KubeArchiveEndpointDiscovery:
         try:
             for namespace in self._common_namespaces:
                 try:
-                    route = self.k8s_custom_api.get_namespaced_custom_object(
+                    route = await k8s_call(self.k8s_custom_api.get_namespaced_custom_object,
                         group='route.openshift.io',
                         version='v1',
                         namespace=namespace,
@@ -284,7 +286,7 @@ class KubeArchiveEndpointDiscovery:
                         name='kubearchive-api-server'
                     )
 
-                    if not namespace_is_trusted(self.k8s_core_api, namespace):
+                    if not await k8s_offload(namespace_is_trusted, self.k8s_core_api, namespace):
                         continue
 
                     # Extract host from route spec
@@ -315,12 +317,12 @@ class KubeArchiveEndpointDiscovery:
         try:
             for namespace in self._common_namespaces:
                 try:
-                    ingress = self.k8s_networking_api.read_namespaced_ingress(
+                    ingress = await k8s_call(self.k8s_networking_api.read_namespaced_ingress,
                         name='kubearchive-api-server',
                         namespace=namespace
                     )
 
-                    if not namespace_is_trusted(self.k8s_core_api, namespace):
+                    if not await k8s_offload(namespace_is_trusted, self.k8s_core_api, namespace):
                         continue
 
                     # Extract host from ingress rules
@@ -364,12 +366,12 @@ class KubeArchiveEndpointDiscovery:
         try:
             for namespace in self._common_namespaces:
                 try:
-                    service = self.k8s_core_api.read_namespaced_service(
+                    service = await k8s_call(self.k8s_core_api.read_namespaced_service,
                         name='kubearchive-api-server',
                         namespace=namespace
                     )
 
-                    if not namespace_is_trusted(self.k8s_core_api, namespace):
+                    if not await k8s_offload(namespace_is_trusted, self.k8s_core_api, namespace):
                         continue
 
                     # Build service URL
@@ -426,7 +428,8 @@ class KubeArchiveEndpointDiscovery:
                 group='route.openshift.io',
                 version='v1',
                 plural='routes',
-                limit=1
+                limit=1,
+                _request_timeout=DEFAULT_TIMEOUT,
             )
             logger.debug("Detected OpenShift cluster (route.openshift.io API available)")
             return True
@@ -753,7 +756,7 @@ class KubeArchiveClient:
             return token
 
         # For OpenShift clusters, try to get token from oc CLI (user's current session)
-        if self._is_openshift_cluster():
+        if await k8s_offload(self._is_openshift_cluster):
             logger.info("Detected OpenShift cluster, attempting to use oc login token")
             oc_token = await self._get_openshift_token()
             if oc_token:
@@ -799,7 +802,8 @@ class KubeArchiveClient:
                 '/apis/route.openshift.io/v1',
                 'GET',
                 response_type=object,
-                _preload_content=False
+                _preload_content=False,
+                _request_timeout=DEFAULT_TIMEOUT,
             )
             logger.debug("Detected OpenShift cluster (route.openshift.io API available)")
             return True
@@ -908,7 +912,7 @@ class KubeArchiveClient:
         if self._ssl_context is not None and self._ssl_context_key == endpoint:
             return self._ssl_context
 
-        self._ssl_context = self._build_ssl_context(endpoint)
+        self._ssl_context = await k8s_offload(self._build_ssl_context, endpoint)
         self._ssl_context_key = endpoint
         return self._ssl_context
 
@@ -965,7 +969,8 @@ class KubeArchiveClient:
                     continue
                 for secret_name in self._ca_secret_names:
                     try:
-                        secret = _ro.read_namespaced_secret(name=secret_name, namespace=namespace)
+                        secret = _ro.read_namespaced_secret(name=secret_name, namespace=namespace,
+                                                         _request_timeout=DEFAULT_TIMEOUT)
                     except ApiException as e:
                         if e.status != 404:
                             logger.debug(f"Error reading {secret_name} secret in {namespace}: {e}")

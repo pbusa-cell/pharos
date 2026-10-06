@@ -81,7 +81,7 @@ async def test_get_pod_logs_normalizes_mangled_client_output(monkeypatch):
             containers = [type("C", (), {"name": "app"})()]
 
     class FakeCore:
-        def read_namespaced_pod(self, name, namespace):
+        def read_namespaced_pod(self, name, namespace, **kwargs):
             return FakePod()
 
         def read_namespaced_pod_log(self, **kwargs):

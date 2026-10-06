@@ -67,7 +67,7 @@ def _custom_api(crs):
 @pytest.mark.asyncio
 async def test_operator_cr_in_untrusted_namespace_is_skipped():
     core = MagicMock()
-    core.read_namespaced_service.side_effect = lambda name, namespace: _svc(name, namespace)
+    core.read_namespaced_service.side_effect = lambda name, namespace, **kw: _svc(name, namespace)
 
     endpoint = await prom._discover_prometheus_via_operator_crd(
         _custom_api([("evil", "aaa-tenant"), ("k8s", "openshift-monitoring")]), core
@@ -90,7 +90,7 @@ async def test_label_search_accepts_user_workload_monitoring():
 @pytest.mark.asyncio
 async def test_operator_cr_only_untrusted_returns_none():
     core = MagicMock()
-    core.read_namespaced_service.side_effect = lambda name, namespace: _svc(name, namespace)
+    core.read_namespaced_service.side_effect = lambda name, namespace, **kw: _svc(name, namespace)
 
     assert await prom._discover_prometheus_via_operator_crd(_custom_api([("evil", "tenant-a")]), core) is None
 

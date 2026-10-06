@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 
+from core.k8s_async import DEFAULT_TIMEOUT
 from core.readonly_client import ReadOnlyK8sClient
 
 logger = logging.getLogger("lumino-mcp.namespace_trust")
@@ -27,6 +28,9 @@ def namespace_is_trusted(core_api, namespace: str) -> bool:
     openshift-*, kube-* and default are trusted without an API call. Any other
     namespace is trusted only when it can be read and has no
     openshift.io/requester annotation (i.e. it was not self-provisioned).
+
+    Sync (one API request with a timeout); async callers run it with
+    ``await k8s_offload(namespace_is_trusted, core_api, namespace)``.
     """
     if namespace == "default" or namespace.startswith(_PLATFORM_PREFIXES):
         return True
@@ -34,7 +38,7 @@ def namespace_is_trusted(core_api, namespace: str) -> bool:
         logger.warning(f"Not trusting namespace {namespace!r} for discovery: cannot read it (no core API)")
         return False
     try:
-        ns = ReadOnlyK8sClient.wrap(core_api).read_namespace(name=namespace)
+        ns = ReadOnlyK8sClient.wrap(core_api).read_namespace(name=namespace, _request_timeout=DEFAULT_TIMEOUT)
     except Exception as e:
         if getattr(e, "status", None) == 404:
             logger.debug(f"Namespace {namespace!r} does not exist")

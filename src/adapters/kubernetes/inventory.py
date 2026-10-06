@@ -3,13 +3,14 @@ the read-only client returning canonical InventoryBatch.  Phase-3 reference
 implementation; tool bodies do not route through this yet (2b is gate-only)."""
 from __future__ import annotations
 
-import asyncio
 from typing import Tuple
 
 try:
+    from core.k8s_async import k8s_call
     from core.readonly_client import ReadOnlyK8sClient
     from core.signals import InventoryBatch, InventoryItem, Provenance
 except ImportError:
+    from src.core.k8s_async import k8s_call
     from src.core.readonly_client import ReadOnlyK8sClient
     from src.core.signals import InventoryBatch, InventoryItem, Provenance
 
@@ -22,7 +23,7 @@ async def fetch_inventory(core_api, namespace: str,
     items = []
     for kind in kinds:
         if kind == "pod":
-            resp = await asyncio.to_thread(
+            resp = await k8s_call(
                 ro.list_namespaced_pod, namespace=namespace, watch=False)
             for p in resp.items:
                 items.append(InventoryItem(
