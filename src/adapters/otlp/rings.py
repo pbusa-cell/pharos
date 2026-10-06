@@ -116,6 +116,11 @@ class LogRing:
         self._dropped_oldest: int = 0
         self._truncated_records: int = 0
 
+    @property
+    def capacity(self) -> int:
+        """Maximum number of records retained."""
+        return self._capacity
+
     # ── write path ────────────────────────────────────────────────────────────
 
     def append(self, recv_ts: float, record: Any) -> None:
@@ -131,6 +136,19 @@ class LogRing:
                 self._buf.popleft()
                 self._dropped_oldest += 1
             self._buf.append((recv_ts, record))
+
+    def note_dropped(self, n: int) -> None:
+        """Count ``n`` records as dropped without buffering them.
+
+        The receiver skips the older records of a batch larger than the ring
+        (they would be evicted by the same batch anyway); counting them here
+        keeps ``dropped_oldest`` identical to appending and evicting them.
+        ``n <= 0`` is a no-op.
+        """
+        if n <= 0:
+            return
+        with self._lock:
+            self._dropped_oldest += n
 
     def note_truncated(self, n: int) -> None:
         """Add ``n`` to the cumulative truncated-record counter.

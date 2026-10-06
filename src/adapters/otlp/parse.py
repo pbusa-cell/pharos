@@ -32,6 +32,18 @@ Entity precedence
   Resource attribute ``k8s.pod.name`` > ``service.name`` > ``"otlp"``
   (fallback).
 
+Attribute count limit (C01)
+  ``max_record_bytes`` counts characters, not objects, so thousands of short
+  attributes fit any byte budget. At most ``MAX_ATTRIBUTES`` resource and
+  ``MAX_ATTRIBUTES`` record-level attributes are kept per record (first ones,
+  in order); a record that lost attributes counts as truncated. ``entity`` is
+  derived from ALL resource attributes before the limit applies.
+
+Newest-records mode (C01)
+  ``parse_newest_log_records`` keeps only the newest ``max_records`` records
+  of the request while parsing and reports how many older ones it skipped,
+  so a request never materialises more records than the ring can hold.
+
 Exception surface
   ``parse_export_logs_request`` raises ``ValueError`` for structurally invalid
   bodies (non-dict, required fields not lists, required fields not dicts).
@@ -45,7 +57,9 @@ Outbound calls
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+import collections
+import itertools
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from adapters.otlp.rings import iso_z
 from core.signals import LogRecord
@@ -59,6 +73,10 @@ _NANO_MAX: int = 2**63
 # present on every record (truncated or not) so Entity selectors never miss
 # an over-budget record.
 _ENTITY_MAX_CHARS: int = 512
+
+# Attributes kept per resource and per log record (OpenTelemetry SDK default
+# attribute count limit).
+MAX_ATTRIBUTES: int = 128
 
 
 def _parse_nano_to_iso(raw: Any) -> Optional[str]:
@@ -157,6 +175,13 @@ def _parse_attrs(attr_list: Any) -> Dict[str, Any]:
     return result
 
 
+def _cap_attrs(attrs: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
+    """Keep the first MAX_ATTRIBUTES attributes; return (attrs, dropped_any)."""
+    if len(attrs) <= MAX_ATTRIBUTES:
+        return attrs, False
+    return dict(itertools.islice(attrs.items(), MAX_ATTRIBUTES)), True
+
+
 def _extract_entity(resource_attrs: Dict[str, Any]) -> str:
     """Extract the entity name from resource attributes.
 
@@ -241,6 +266,42 @@ def parse_export_logs_request(
         ``scopeLogs``, ``logRecords``) are not lists.
         Messages NEVER embed payload content (F3 / M6b).
     """
+    records: List[LogRecord] = []
+    truncated_count = 0
+    for record, truncated in _iter_log_records(body, max_record_bytes):
+        records.append(record)
+        truncated_count += truncated
+    return records, truncated_count
+
+
+def parse_newest_log_records(
+    body: dict,
+    *,
+    max_record_bytes: int,
+    max_records: int,
+) -> Tuple[List[LogRecord], int, int]:
+    """Like :func:`parse_export_logs_request`, but keep only the newest records.
+
+    At most ``max_records`` records (the last ones in request order) are held
+    at any time, so memory does not grow with the number of records in the
+    request.
+
+    Returns ``(records, truncated_count, skipped_count)``. ``truncated_count``
+    covers every parsed record; ``skipped_count`` is the number of older
+    records not returned — the caller counts them as dropped from the ring.
+    """
+    newest: "collections.deque[LogRecord]" = collections.deque(maxlen=max_records)
+    truncated_count = 0
+    total = 0
+    for record, truncated in _iter_log_records(body, max_record_bytes):
+        newest.append(record)
+        truncated_count += truncated
+        total += 1
+    return list(newest), truncated_count, total - len(newest)
+
+
+def _iter_log_records(body: Any, max_record_bytes: int) -> Iterator[Tuple[LogRecord, bool]]:
+    """Yield ``(record, was_truncated)`` for each log record in request order."""
     if not isinstance(body, dict):
         raise ValueError(
             "OTLP request body must be a JSON object (dict)"
@@ -251,9 +312,6 @@ def parse_export_logs_request(
         raise ValueError(
             "OTLP body: 'resourceLogs' must be an array"
         )
-
-    records: List[LogRecord] = []
-    truncated_count: int = 0
 
     for rl in resource_logs_raw:
         if not isinstance(rl, dict):
@@ -266,7 +324,9 @@ def parse_export_logs_request(
         if not isinstance(resource_raw, dict):
             resource_raw = {}
         resource_attrs = _parse_attrs(resource_raw.get("attributes", []))
+        # Entity comes from ALL resource attributes; the count limit applies after.
         entity = _extract_entity(resource_attrs)
+        resource_attrs, resource_capped = _cap_attrs(resource_attrs)
 
         scope_logs_raw = rl.get("scopeLogs", [])
         if not isinstance(scope_logs_raw, list):
@@ -311,8 +371,10 @@ def parse_export_logs_request(
                 # Resource attrs provide baseline; record-level attrs override.
                 # Note: ``entity`` is excluded here — it is re-attached AFTER
                 # budget enforcement so it survives truncation (see F5 note).
+                own_attrs, record_capped = _cap_attrs(_parse_attrs(lr.get("attributes", [])))
                 record_attrs: Dict[str, Any] = dict(resource_attrs)
-                record_attrs.update(_parse_attrs(lr.get("attributes", [])))
+                record_attrs.update(own_attrs)
+                truncated = resource_capped or record_capped
 
                 # ── Budget enforcement (F5) ────────────────────────────────
                 # ``entity`` is budget-exempt and not present in record_attrs
@@ -324,7 +386,7 @@ def parse_export_logs_request(
                     body_str, record_attrs = _enforce_budget(
                         body_str, record_attrs, max_record_bytes
                     )
-                    truncated_count += 1
+                    truncated = True
 
                 # Re-attach entity AFTER budget enforcement (budget-exempt).
                 # Capped at _ENTITY_MAX_CHARS so a huge k8s.pod.name value
@@ -333,11 +395,9 @@ def parse_export_logs_request(
                 # resource attrs only, enforced by setting here last).
                 record_attrs["entity"] = entity[:_ENTITY_MAX_CHARS]
 
-                records.append(LogRecord(
+                yield LogRecord(
                     timestamp=timestamp,
                     body=body_str,
                     severity=severity,
                     attributes=record_attrs,
-                ))
-
-    return records, truncated_count
+                ), truncated
