@@ -274,8 +274,20 @@ _SAFE_SECRET_ANNOTATIONS = frozenset({
     "kubernetes.io/service-account.name",
     "kubernetes.io/service-account.uid",
     "openshift.io/token-secret.name",
+    "openshift.io/description",
+    "openshift.io/owning-component",
+    "openshift.io/internal-registry-auth-token.binding",
+    "openshift.io/internal-registry-auth-token.service-account",
 })
-_SAFE_SECRET_ANNOTATION_PREFIXES = ("cert-manager.io/", "meta.helm.sh/")
+# Never add a broad "openshift.io/" prefix: openshift.io/token-secret.value
+# holds a service-account token.
+_SAFE_SECRET_ANNOTATION_PREFIXES = (
+    "cert-manager.io/",
+    "meta.helm.sh/",
+    # service-ca operator: serving-cert expiry and originating service
+    "service.alpha.openshift.io/",
+    "service.beta.openshift.io/",
+)
 
 
 def _redact_secret_annotations(annotations: Dict[str, Any]) -> Dict[str, Any]:

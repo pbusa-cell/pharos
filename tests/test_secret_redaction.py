@@ -221,6 +221,30 @@ def test_extract_resource_info_redacts_secret_annotations(hint):
     _assert_no_leak(json.dumps(info, default=str))
 
 
+def test_operational_openshift_annotations_stay_visible():
+    """Serving-cert expiry and ownership are needed for certificate debugging."""
+    sys.path.insert(0, str(SRC))
+    from helpers.utils import redact_secret
+
+    secret = _fake_secret().to_dict()
+    visible = {
+        "service.beta.openshift.io/expiry": "2028-08-01T00:00:00Z",
+        "service.alpha.openshift.io/expiry": "2028-08-01T00:00:00Z",
+        "service.beta.openshift.io/originating-service-name": "console-plugin",
+        "openshift.io/description": "Serving certificate for the console plugin",
+        "openshift.io/owning-component": "Pipelines",
+        "openshift.io/internal-registry-auth-token.service-account": "builder",
+    }
+    secret["metadata"]["annotations"].update(visible)
+
+    annotations = redact_secret(secret)["metadata"]["annotations"]
+
+    for key, value in visible.items():
+        assert annotations[key] == value, key
+    assert annotations[TOKEN_SECRET_VALUE] == "<redacted>"
+    assert annotations[LAST_APPLIED] == "<redacted>"
+
+
 def test_extract_resource_info_keeps_last_applied_on_non_secret():
     sys.path.insert(0, str(SRC))
     from helpers.utils import extract_resource_info
