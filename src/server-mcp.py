@@ -183,7 +183,7 @@ from core.registry import build_registry, SourceEntry, ADAPTER_CAPABILITIES as _
 from core.selector import make_capability_error, Entity, TimeWindow, Limit
 from core.timewindow import make_time_window
 from core.errors import AdapterError
-from core.k8s_async import k8s_call, LOG_TIMEOUT
+from core.k8s_async import k8s_call, LOG_TIMEOUT, DEFAULT_TIMEOUT
 from core.credentials import _parse_credential_ref
 from engines.pattern_scan import scan as _scan_logs
 from engines.log_anomaly import detect as _detect_log_anomalies
@@ -1798,7 +1798,7 @@ async def list_pods_in_namespace(namespace: str, limit: Optional[int] = 200, sou
     try:
         logger.info(f"Listing pods in namespace: {namespace}")
         _ro = ReadOnlyK8sClient.wrap(_clients.core_api)
-        pod_list_resp = await asyncio.to_thread(
+        pod_list_resp = await k8s_call(
             _ro.list_namespaced_pod, namespace=namespace, limit=limit)
         pod_list = pod_list_resp.items
         for pod in pod_list:
@@ -1990,17 +1990,17 @@ async def get_kubernetes_resource(
             if resource_type in ['namespace', 'node', 'persistentvolume', 'pv']:
                 # Cluster-scoped resources
                 method = getattr(_ro_core, f'read_{method_name[:-1]}')
-                resource_obj = await asyncio.to_thread(method, name=name)
+                resource_obj = await k8s_call(method, name=name)
             elif resource_type == 'endpoints':
                 # Endpoints uses plural form in method name
-                resource_obj = await asyncio.to_thread(
+                resource_obj = await k8s_call(
                     _ro_core.read_namespaced_endpoints,
                     name=name, namespace=namespace
                 )
             else:
                 # Namespaced resources
                 method = getattr(_ro_core, f'read_namespaced_{method_name[:-1]}')
-                resource_obj = await asyncio.to_thread(
+                resource_obj = await k8s_call(
                     method, name=name, namespace=namespace
                 )
 
@@ -2010,34 +2010,34 @@ async def get_kubernetes_resource(
             # stores the plural 'storage_classes' for the supported-types list.
             # Dynamic dispatch via method_name[:-1] doesn't work here because
             # 'storage_classes'[:-1] == 'storage_classe', not 'storage_class'.
-            resource_obj = await asyncio.to_thread(
+            resource_obj = await k8s_call(
                 _ro_storage.read_storage_class, name=name
             )
 
         elif resource_type in autoscaling_resources:
             method_name, api_version = autoscaling_resources[resource_type]
             method = getattr(_ro_autoscaling, f'read_namespaced_{method_name[:-1]}')
-            resource_obj = await asyncio.to_thread(
+            resource_obj = await k8s_call(
                 method, name=name, namespace=namespace
             )
 
         elif resource_type in apps_resources:
             method_name, api_version = apps_resources[resource_type]
             method = getattr(_ro_apps, f'read_namespaced_{method_name[:-1]}')
-            resource_obj = await asyncio.to_thread(
+            resource_obj = await k8s_call(
                 method, name=name, namespace=namespace
             )
 
         elif resource_type in batch_resources:
             method_name, api_version = batch_resources[resource_type]
             method = getattr(_ro_batch, f'read_namespaced_{method_name[:-1]}')
-            resource_obj = await asyncio.to_thread(
+            resource_obj = await k8s_call(
                 method, name=name, namespace=namespace
             )
 
         elif resource_type in networking_resources:
             method_name, api_version = networking_resources[resource_type]
-            resource_obj = await asyncio.to_thread(
+            resource_obj = await k8s_call(
                 _ro_custom.get_namespaced_custom_object,
                 group="networking.k8s.io",
                 version="v1",
@@ -2049,7 +2049,7 @@ async def get_kubernetes_resource(
         elif resource_type in monitoring_resources:
             method_name, api_version = monitoring_resources[resource_type]
             group, version = api_version.split('/')
-            resource_obj = await asyncio.to_thread(
+            resource_obj = await k8s_call(
                 _ro_custom.get_namespaced_custom_object,
                 group=group,
                 version=version,
@@ -2061,7 +2061,7 @@ async def get_kubernetes_resource(
         elif resource_type in admission_resources:
             method_name, api_version = admission_resources[resource_type]
             group, version = api_version.split('/')
-            resource_obj = await asyncio.to_thread(
+            resource_obj = await k8s_call(
                 _ro_custom.get_cluster_custom_object,
                 group=group,
                 version=version,
@@ -2075,7 +2075,7 @@ async def get_kubernetes_resource(
 
             if resource_type == 'clustertask':
                 # Cluster-scoped Tekton resource
-                resource_obj = await asyncio.to_thread(
+                resource_obj = await k8s_call(
                     _ro_custom.get_cluster_custom_object,
                     group=group,
                     version=version,
@@ -2084,7 +2084,7 @@ async def get_kubernetes_resource(
                 )
             else:
                 # Namespaced Tekton resource
-                resource_obj = await asyncio.to_thread(
+                resource_obj = await k8s_call(
                     _ro_custom.get_namespaced_custom_object,
                     group=group,
                     version=version,
@@ -2096,7 +2096,7 @@ async def get_kubernetes_resource(
         elif resource_type in tekton_triggers_resources:
             method_name, api_version = tekton_triggers_resources[resource_type]
             group, version = api_version.split('/')
-            resource_obj = await asyncio.to_thread(
+            resource_obj = await k8s_call(
                 _ro_custom.get_namespaced_custom_object,
                 group=group,
                 version=version,
@@ -2108,7 +2108,7 @@ async def get_kubernetes_resource(
         elif resource_type in konflux_resources:
             method_name, api_version = konflux_resources[resource_type]
             group, version = api_version.split('/')
-            resource_obj = await asyncio.to_thread(
+            resource_obj = await k8s_call(
                 _ro_custom.get_namespaced_custom_object,
                 group=group,
                 version=version,
@@ -2215,7 +2215,7 @@ async def get_pipelinerun_logs(
         # Tekton adds 'tekton.dev/pipelineRun' label to all pods in a PipelineRun
         label_selector = f"tekton.dev/pipelineRun={pipelinerun_name}"
 
-        pod_list = await asyncio.to_thread(
+        pod_list = await k8s_call(
             _ro.list_namespaced_pod,
             namespace=namespace,
             label_selector=label_selector,
@@ -2224,7 +2224,7 @@ async def get_pipelinerun_logs(
         if not pod_list.items:
             # Fallback: Try alternative label format used by some Tekton versions
             label_selector_alt = f"tekton.dev/pipeline={pipelinerun_name}"
-            pod_list = await asyncio.to_thread(
+            pod_list = await k8s_call(
                 _ro.list_namespaced_pod,
                 namespace=namespace,
                 label_selector=label_selector_alt,
@@ -3870,7 +3870,8 @@ async def find_pipeline(
                     version="v1",
                     namespace=ns,
                     plural="pipelineruns",
-                    limit=pipeline_runs_limit
+                    limit=pipeline_runs_limit,
+                    _request_timeout=DEFAULT_TIMEOUT
                 )
             except ApiException as e:
                 return {"error": str(e), "items": []}
@@ -3883,7 +3884,8 @@ async def find_pipeline(
                     group="tekton.dev",
                     version="v1",
                     plural="pipelineruns",
-                    limit=safe_limit
+                    limit=safe_limit,
+                    _request_timeout=DEFAULT_TIMEOUT
                 )
             except ApiException as e:
                 return {"error": str(e), "items": []}
@@ -3895,7 +3897,8 @@ async def find_pipeline(
                     version="v1",
                     namespace=ns,
                     plural="taskruns",
-                    limit=task_runs_limit
+                    limit=task_runs_limit,
+                    _request_timeout=DEFAULT_TIMEOUT
                 )
             except ApiException as e:
                 return {"error": str(e), "items": []}
@@ -3909,7 +3912,8 @@ async def find_pipeline(
                     group="tekton.dev",
                     version="v1",
                     plural="taskruns",
-                    limit=safe_limit
+                    limit=safe_limit,
+                    _request_timeout=DEFAULT_TIMEOUT
                 )
             except ApiException as e:
                 return {"error": str(e), "items": []}
@@ -3920,7 +3924,8 @@ async def find_pipeline(
                     group="pipelinesascode.tekton.dev",
                     version="v1alpha1",
                     plural="repositories",
-                    limit=500
+                    limit=500,
+                    _request_timeout=DEFAULT_TIMEOUT
                 )
             except ApiException as e:
                 return {"error": str(e), "items": []}
@@ -4533,7 +4538,8 @@ async def search_resources_by_labels(
                             if api_info["api"] == "core_v1":
                                 api_client = _ro_core
                                 method = getattr(api_client, api_info["method"])
-                                response = method(
+                                response = await k8s_call(
+                                    method,
                                     namespace=namespace,
                                     label_selector=label_selector,
                                     limit=limit_per_type
@@ -4541,7 +4547,8 @@ async def search_resources_by_labels(
                             elif api_info["api"] == "apps_v1":
                                 api_client = _ro_apps
                                 method = getattr(api_client, api_info["method"])
-                                response = method(
+                                response = await k8s_call(
+                                    method,
                                     namespace=namespace,
                                     label_selector=label_selector,
                                     limit=limit_per_type
@@ -4549,7 +4556,8 @@ async def search_resources_by_labels(
                             elif api_info["api"] == "batch_v1":
                                 api_client = _ro_batch
                                 method = getattr(api_client, api_info["method"])
-                                response = method(
+                                response = await k8s_call(
+                                    method,
                                     namespace=namespace,
                                     label_selector=label_selector,
                                     limit=limit_per_type
@@ -4619,7 +4627,8 @@ async def search_resources_by_labels(
                         if api_info["api"] == "core_v1":
                             api_client = _ro_core
                             method = getattr(api_client, api_info["method"])
-                            response = method(
+                            response = await k8s_call(
+                                method,
                                 label_selector=label_selector,
                                 limit=limit_per_type
                             )
@@ -6375,7 +6384,7 @@ async def get_etcd_logs(
 
     logger.info(f"[{tool_name}] Attempting OpenShift etcd strategy: ns='{os_namespace}', label='{os_label_selector}'")
     try:
-        pod_list_os = await asyncio.to_thread(
+        pod_list_os = await k8s_call(
             ro.list_namespaced_pod,
             namespace=os_namespace,
             label_selector=os_label_selector,
@@ -6436,7 +6445,7 @@ async def get_etcd_logs(
     standard_k8s_results: Dict[str, str] = {}
 
     try:
-        pod_list_kube = await asyncio.to_thread(
+        pod_list_kube = await k8s_call(
             ro.list_namespaced_pod,
             namespace=kube_namespace,
             label_selector=kube_label_selector,
@@ -8599,7 +8608,7 @@ async def live_system_topology_mapper(
                 # Get all namespaces
                 all_namespaces = []
                 try:
-                    ns_list = await asyncio.to_thread(core_api.list_namespace)
+                    ns_list = await k8s_call(core_api.list_namespace)
                     all_namespaces = [ns.metadata.name for ns in ns_list.items]
 
                     # Apply namespace filter if specified

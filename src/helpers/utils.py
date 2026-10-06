@@ -37,10 +37,10 @@ logger = logging.getLogger("lumino-mcp")
 # Guarded import so helpers.utils is importable both at runtime (src/ on path)
 # and in isolated pytest collection (src/ not on path).
 try:
-    from core.k8s_async import k8s_call
+    from core.k8s_async import LOG_TIMEOUT, k8s_call
     from core.readonly_client import ReadOnlyCoreV1, ReadOnlyK8sClient
 except ImportError:
-    from src.core.k8s_async import k8s_call
+    from src.core.k8s_async import LOG_TIMEOUT, k8s_call
     from src.core.readonly_client import ReadOnlyCoreV1, ReadOnlyK8sClient
 
 
@@ -605,7 +605,7 @@ async def get_all_pod_logs(
 
     try:
         # Get the pod object to find its containers
-        pod = await asyncio.to_thread(
+        pod = await k8s_call(
             k8s_core_api.read_namespaced_pod,
             name=pod_name,
             namespace=namespace
@@ -657,8 +657,9 @@ async def get_all_pod_logs(
                 log_params['container'] = container_name
 
                 # Read the logs for the specific container
-                logs = await asyncio.to_thread(
+                logs = await k8s_call(
                     k8s_core_api.read_namespaced_pod_log,
+                    timeout=LOG_TIMEOUT,
                     **log_params
                 )
                 container_logs[container_name] = normalize_pod_log_text(logs)
@@ -3589,7 +3590,7 @@ async def _get_fallback_cluster_health(core_api) -> Dict[str, Any]:
             # Use the proper VersionApi to get cluster version
             try:
                 version_api = VersionApi(core_api.api_client)
-                version_info = version_api.get_code()
+                version_info = await k8s_call(version_api.get_code)
                 cluster_info = {
                     "cluster_version": version_info.git_version or "unknown",
                     "platform": version_info.platform or "unknown",

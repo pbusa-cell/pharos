@@ -9,9 +9,16 @@ HTTP call, and without ``_request_timeout`` a hung apiserver freezes the
 server forever. Calls go through ``core.k8s_async.k8s_call`` instead (worker
 thread + request timeout + bounded concurrency).
 
-Ratchet: the AST scan below must find zero direct Kubernetes calls in any
-``async def`` under src/ (calls inside nested sync functions are allowed; those
-run wherever their caller runs them, normally asyncio.to_thread).
+Ratchet: the AST scan below must find, in any ``async def`` under src/:
+  1. no direct Kubernetes call (``api.list_...()``);
+  2. no call of a method taken with ``getattr(<api object>, ...)``;
+  3. no ``asyncio.to_thread`` / ``run_in_executor`` of a Kubernetes method
+     (or a lambda / getattr-method wrapping one) — that runs off the loop but
+     with no request timeout and outside k8s_call's thread bound;
+  4. no direct call of a sync function or method of the same module that
+     makes Kubernetes calls (it blocks just like rule 1); run it with
+     ``k8s_offload``.
+Calls inside nested sync functions are judged where those functions run.
 """
 import ast
 import asyncio
@@ -28,33 +35,105 @@ sys.path.insert(0, str(SRC))
 from core import k8s_async  # noqa: E402
 from core.k8s_async import k8s_call  # noqa: E402
 
-_K8S_PREFIXES = ("list_", "read_", "get_namespaced_custom_object", "get_cluster_custom_object")
+_K8S_PREFIXES = ("list_", "read_", "get_namespaced_custom_object", "get_cluster_custom_object", "get_code")
 _NOT_K8S = {"list_models", "list_sources", "read_text", "read_bytes", "list_kube_config_contexts"}
+_OFFLOAD = {"to_thread", "run_in_executor"}
 
 
-def _direct_k8s_calls(fn: ast.AsyncFunctionDef):
+def _is_k8s_attr(node) -> bool:
+    return (isinstance(node, ast.Attribute) and node.attr.startswith(_K8S_PREFIXES)
+            and node.attr not in _NOT_K8S)
+
+
+def _own_nodes(fn):
+    """Nodes of fn's body, not descending into nested defs, lambdas or classes."""
     stack = list(fn.body)
     while stack:
         node = stack.pop()
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
             continue
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-            if node.func.attr.startswith(_K8S_PREFIXES) and node.func.attr not in _NOT_K8S:
-                yield node
+        yield node
         stack.extend(ast.iter_child_nodes(node))
+
+
+def _direct_k8s_calls(fn: ast.AsyncFunctionDef):
+    for node in _own_nodes(fn):
+        if isinstance(node, ast.Call) and _is_k8s_attr(node.func):
+            yield node
+
+
+def _has_timeout(call: ast.Call) -> bool:
+    return any(k.arg == "_request_timeout" for k in call.keywords)
+
+
+def _api_getattr_names(fn) -> set:
+    """Names assigned from getattr(<obj whose name mentions api / _ro>, ...)."""
+    names = set()
+    for node in _own_nodes(fn):
+        if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name) and node.value.func.id == "getattr"
+                and node.value.args):
+            target = ast.unparse(node.value.args[0])
+            if "api" in target.lower() or target.startswith("_ro"):
+                names.update(t.id for t in node.targets if isinstance(t, ast.Name))
+    return names
+
+
+def _sync_k8s_functions(tree) -> dict:
+    """Sync defs in a module that call Kubernetes directly -> first method called."""
+    found = {}
+    for fn in ast.walk(tree):
+        if isinstance(fn, ast.FunctionDef):
+            for node in _own_nodes(fn):
+                if isinstance(node, ast.Call) and _is_k8s_attr(node.func):
+                    found[fn.name] = node.func.attr
+                    break
+    return found
+
+
+def _blocking_or_unbounded(fn: ast.AsyncFunctionDef, sync_k8s: dict):
+    """Yield (lineno, description) for every rule violation in fn."""
+    api_methods = _api_getattr_names(fn)
+    for node in _own_nodes(fn):
+        if not isinstance(node, ast.Call):
+            continue
+        f = node.func
+        if _is_k8s_attr(f):
+            yield node.lineno, f"direct .{f.attr}(...)"
+        elif isinstance(f, ast.Name) and f.id in api_methods:
+            yield node.lineno, f"getattr method {f.id}(...)"
+        elif isinstance(f, ast.Name) and f.id in sync_k8s:
+            yield node.lineno, f"sync helper {f.id}() calls .{sync_k8s[f.id]}"
+        elif (isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name)
+              and f.value.id == "self" and f.attr in sync_k8s):
+            yield node.lineno, f"sync method self.{f.attr}() calls .{sync_k8s[f.attr]}"
+        name = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", "")
+        if name in _OFFLOAD:
+            args = node.args[1:] if name == "run_in_executor" else node.args
+            if not args or _has_timeout(node):
+                continue
+            target = args[0]
+            if _is_k8s_attr(target) or (isinstance(target, ast.Name) and target.id in api_methods):
+                yield node.lineno, f"{name}({ast.unparse(target)}) without timeout/bound"
+            elif isinstance(target, ast.Lambda):
+                for inner in ast.walk(target.body):
+                    if isinstance(inner, ast.Call) and _is_k8s_attr(inner.func) and not _has_timeout(inner):
+                        yield node.lineno, f"{name}(lambda: .{inner.func.attr}(...)) without timeout/bound"
 
 
 def test_no_direct_k8s_calls_in_async_functions():
     hits = []
     for path in sorted(SRC.rglob("*.py")):
         tree = ast.parse(path.read_text())
+        sync_k8s = _sync_k8s_functions(tree)
         for fn in ast.walk(tree):
             if isinstance(fn, ast.AsyncFunctionDef):
-                for call in _direct_k8s_calls(fn):
-                    hits.append(f"{path.relative_to(SRC.parent)}:{call.lineno} {fn.name}() -> .{call.func.attr}(...)")
+                for lineno, what in _blocking_or_unbounded(fn, sync_k8s):
+                    hits.append(f"{path.relative_to(SRC.parent)}:{lineno} {fn.name}(): {what}")
     assert not hits, (
-        "blocking Kubernetes calls on the event loop; use `await k8s_call(api.method, ...)`:\n"
-        + "\n".join(hits)
+        "Kubernetes calls that block the event loop or run without a timeout/bound; "
+        "use `await k8s_call(api.method, ...)` (or `await k8s_offload(sync_fn, ...)` "
+        "for a sync helper that sets its own timeouts):\n" + "\n".join(sorted(hits))
     )
 
 
@@ -138,6 +217,42 @@ def test_k8s_call_bounds_concurrency():
     assert state["max"] <= k8s_async.MAX_CONCURRENT_CALLS
 
 
+def test_cancelled_calls_do_not_exceed_thread_bound():
+    """A deadline cancels the await, not the thread: threads must still be bounded."""
+    lock = threading.Lock()
+    state = {"now": 0, "max": 0}
+
+    def slow(_request_timeout=None):
+        with lock:
+            state["now"] += 1
+            state["max"] = max(state["max"], state["now"])
+        time.sleep(0.2)
+        with lock:
+            state["now"] -= 1
+
+    async def main():
+        for _ in range(4):  # repeated timed-out fan-outs, as under a slow apiserver
+            try:
+                await asyncio.wait_for(asyncio.gather(*(k8s_call(slow) for _ in range(20))), 0.05)
+            except asyncio.TimeoutError:
+                pass
+        await asyncio.gather(*(k8s_call(slow) for _ in range(20)))
+
+    asyncio.run(main())
+    assert state["max"] <= k8s_async.MAX_CONCURRENT_CALLS
+
+
+def test_k8s_offload_runs_sync_helper_off_loop():
+    seen = {}
+
+    def helper(a, b=None):
+        seen.update(a=a, b=b, thread=threading.current_thread().name)
+        return "done"
+
+    assert asyncio.run(k8s_async.k8s_offload(helper, 1, b=2)) == "done"
+    assert seen["a"] == 1 and seen["b"] == 2 and seen["thread"].startswith("k8s-call")
+
+
 def test_k8s_call_works_across_event_loops():
     """The semaphore is per loop; a second asyncio.run must not reuse the first loop's."""
     for _ in range(2):
@@ -150,3 +265,19 @@ def test_k8s_call_propagates_errors():
 
     with pytest.raises(ValueError):
         asyncio.run(k8s_call(boom))
+
+
+def _hits(src):
+    tree = ast.parse(src)
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef))
+    return list(_blocking_or_unbounded(fn, _sync_k8s_functions(tree)))
+
+
+def test_scanner_rules():
+    assert _hits("async def f(core_api):\n    m = getattr(core_api, 'list_x')\n    m(namespace='a')\n")
+    assert _hits("async def f(api):\n    await asyncio.to_thread(api.list_namespaced_pod, 'a')\n")
+    assert _hits("async def f(api, loop):\n    await loop.run_in_executor(None, lambda: api.list_x())\n")
+    assert _hits("def helper(api):\n    return api.read_namespace('x')\n"
+                 "async def f(api):\n    helper(api)\n")
+    assert not _hits("async def f(api):\n    await asyncio.to_thread(api.list_x, 'a', _request_timeout=5)\n")
+    assert not _hits("async def f(reg):\n    fn = getattr(reg, 'query')\n    fn()\n")

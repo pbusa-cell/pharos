@@ -699,6 +699,7 @@ def make_pipeline_tracer(reg):
 
             # Correlate pipeline events across clusters (parallelized)
             trace_warnings: List[str] = []
+            correlation_timed_out = False
             try:
                 pipeline_flow = await asyncio.wait_for(correlate_pipeline_events(
                     trace_identifier=trace_identifier,
@@ -713,6 +714,7 @@ def make_pipeline_tracer(reg):
                 ), timeout=TRACE_CORRELATE_TIMEOUT)
             except asyncio.TimeoutError:
                 pipeline_flow = []
+                correlation_timed_out = True
                 trace_warnings.append(
                     f"Pipeline correlation timed out after {TRACE_CORRELATE_TIMEOUT:.0f}s; "
                     "pass namespaces= or a lower max_namespaces to narrow the search"
@@ -726,8 +728,12 @@ def make_pipeline_tracer(reg):
             # nothing (cost control: one archive HTTP query per namespace).
             # Best-effort: an unreachable archive never breaks the live trace.
             try:
-                archive_namespaces = list(namespaces) if namespaces else (
-                    (tekton_ns_list or [])[:max_namespaces] if not pipeline_flow else []
+                # After a correlation timeout the apiserver is slow; do not
+                # start the archive dredge on top of it.
+                archive_namespaces = [] if correlation_timed_out else (
+                    list(namespaces) if namespaces else (
+                        (tekton_ns_list or [])[:max_namespaces] if not pipeline_flow else []
+                    )
                 )
                 if archive_namespaces:
                     # Exact label-selector queries whenever the trace type maps to

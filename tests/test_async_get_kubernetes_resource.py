@@ -114,9 +114,9 @@ class TestAsyncioToThread:
         start, end, func_lines = _extract_function_source_lines(source)
         assert func_lines, "Could not extract function source lines"
         func_text = "\n".join(func_lines)
-        count = func_text.count("await asyncio.to_thread(")
+        count = func_text.count("await k8s_call(")
         assert count >= 10, (
-            f"Expected at least 10 'await asyncio.to_thread(' calls in function body, found {count}"
+            f"Expected at least 10 'await k8s_call(' calls in function body, found {count}"
         )
 
     def test_no_direct_k8s_api_assignments(self):

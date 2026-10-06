@@ -36,6 +36,13 @@ async def test_correlation_stage_times_out(server, monkeypatch):
 
     monkeypatch.setattr(tools, "correlate_pipeline_events", never_finishes)
     monkeypatch.setattr(tools, "TRACE_CORRELATE_TIMEOUT", 0.2)
+    archive_calls = []
+
+    async def record_archive(namespace, **kwargs):
+        archive_calls.append(namespace)
+        return []
+
+    monkeypatch.setattr(server, "_query_archived_plrs_for_trace", record_archive)
 
     started = time.monotonic()
     result = _as_dict(await server.mcp.call_tool(
@@ -46,6 +53,7 @@ async def test_correlation_stage_times_out(server, monkeypatch):
     assert time.monotonic() - started < 5
     assert result["pipeline_flow"] == []
     assert any("timed out" in w for w in result["warnings"])
+    assert archive_calls == [], "archive dredge started after a correlation timeout"
 
 
 @pytest.mark.asyncio

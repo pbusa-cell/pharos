@@ -7,7 +7,7 @@ import logging
 import aiohttp
 from typing import Dict, List, Optional, Any
 from kubernetes import client
-from core.k8s_async import k8s_call
+from core.k8s_async import k8s_call, k8s_offload
 from core.namespace_trust import namespace_is_trusted
 from core.readonly_client import ReadOnlyK8sClient
 from core.tls import PLAIN_HTTP_TOKEN_HINT, TLS_HINT, bearer_token_allowed, client_ssl_context
@@ -287,12 +287,12 @@ TRUSTED_MONITORING_NAMESPACES = frozenset({
 })
 
 
-def _first_trusted_service(services, core_api):
+async def _first_trusted_service(services, core_api):
     """First service in a trusted monitoring namespace, or None."""
     for service in services.items:
         namespace = service.metadata.namespace
         if namespace in TRUSTED_MONITORING_NAMESPACES:
-            if namespace_is_trusted(core_api, namespace):
+            if await k8s_offload(namespace_is_trusted, core_api, namespace):
                 return service
             continue
         logger.warning(
@@ -331,7 +331,7 @@ async def _discover_prometheus_via_operator_crd(custom_api, core_api) -> Optiona
 
             if not name or not namespace:
                 continue
-            if namespace not in TRUSTED_MONITORING_NAMESPACES or not namespace_is_trusted(core_api, namespace):
+            if namespace not in TRUSTED_MONITORING_NAMESPACES or not await k8s_offload(namespace_is_trusted, core_api, namespace):
                 logger.warning(
                     f"Ignoring Prometheus CR {namespace}/{name}: namespace is not a trusted "
                     "monitoring namespace (set PROMETHEUS_URL to use it)"
@@ -403,7 +403,7 @@ async def _discover_prometheus_via_services(core_api) -> Optional[str]:
         for namespace in monitoring_namespaces:
             try:
                 services = await k8s_call(_ro.list_namespaced_service, namespace=namespace)
-                if not services.items or not namespace_is_trusted(core_api, namespace):
+                if not services.items or not await k8s_offload(namespace_is_trusted, core_api, namespace):
                     continue
 
                 # Prioritize actual Prometheus server services (not alertmanager, pushgateway, etc.)
@@ -465,7 +465,7 @@ async def _discover_prometheus_via_services(core_api) -> Optional[str]:
                     label_selector=label_selector
                 )
 
-                service = _first_trusted_service(services, core_api)
+                service = await _first_trusted_service(services, core_api)
                 if service:
                     name = service.metadata.name
                     namespace = service.metadata.namespace
@@ -524,7 +524,7 @@ async def _discover_thanos_via_services(core_api) -> Optional[str]:
         for namespace in monitoring_namespaces:
             try:
                 services = await k8s_call(_ro.list_namespaced_service, namespace=namespace)
-                if not services.items or not namespace_is_trusted(core_api, namespace):
+                if not services.items or not await k8s_offload(namespace_is_trusted, core_api, namespace):
                     continue
 
                 for priority_name in priority_names:
@@ -572,7 +572,7 @@ async def _discover_thanos_via_services(core_api) -> Optional[str]:
                 services = await k8s_call(_ro.list_service_for_all_namespaces,
                     label_selector=label_selector
                 )
-                service = _first_trusted_service(services, core_api)
+                service = await _first_trusted_service(services, core_api)
                 if service:
                     name = service.metadata.name
                     namespace = service.metadata.namespace
