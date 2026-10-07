@@ -1,0 +1,56 @@
+# Test fixture for the imagepullbackoff runbook (SPRE-5974).
+#
+# Creates a Deployment that references a deliberately non-existent image tag,
+# triggering ErrImagePull → ImagePullBackOff on the pod.
+#
+# Apply:    oc apply -f imagepullbackoff-test.yaml
+# Watch:    oc get pods -n spre-imagepullbackoff-test -w
+# Events:   oc get events -n spre-imagepullbackoff-test --sort-by=.lastTimestamp
+# Diagnose: run imagepullbackoff diagnostic_steps with
+#           namespace=spre-imagepullbackoff-test and the failing pod name.
+# Cleanup:  oc delete -f imagepullbackoff-test.yaml
+#
+# Notes:
+# - The image tag "this-tag-does-not-exist" will never resolve; the pod stays
+#   in ImagePullBackOff indefinitely until cleanup.
+# - Events will show: Failed / ErrImagePull with "manifest unknown" or similar.
+# - No imagePullSecrets is declared, exercising the "is the pull secret attached
+#   to the SA?" check path.  On clusters requiring explicit pull secrets, add one
+#   to the Deployment spec to test the credential-validation path instead.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: spre-imagepullbackoff-test
+  labels:
+    purpose: spre-runbook-testing
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: intentional-imagepullbackoff
+  namespace: spre-imagepullbackoff-test
+  labels:
+    app: intentional-imagepullbackoff
+    purpose: spre-runbook-testing
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: intentional-imagepullbackoff
+  template:
+    metadata:
+      labels:
+        app: intentional-imagepullbackoff
+    spec:
+      containers:
+        - name: bad-image
+          # Tag intentionally does not exist — triggers ErrImagePull / ImagePullBackOff.
+          image: registry.access.redhat.com/ubi9/ubi-minimal:this-tag-does-not-exist
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi

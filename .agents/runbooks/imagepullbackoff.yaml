@@ -1,0 +1,91 @@
+# ImagePullBackOff runbook — SPRE-5974
+# Schema: spre.agents/v1 Runbook
+# Tools verified against pharos MCP signatures
+apiVersion: spre.agents/v1
+kind: Runbook
+metadata:
+  name: imagepullbackoff
+  description: "Kubernetes cannot pull the container image — bad reference, registry unreachable, or missing pull secret"
+  failure_type: ImagePullBackOff
+spec:
+  trigger:
+    # String match against error/status/log text.
+    patterns:
+      - "ImagePullBackOff"
+      - "ErrImagePull"
+      - "Back-off pulling image"
+      - "failed to pull and unpack image"
+      - "unauthorized: authentication required"
+      - "manifest unknown"
+    # Kubernetes waiting reason signals.
+    events:
+      - "ImagePullBackOff"
+      - "ErrImagePull"
+      - "Failed"
+  diagnostic_steps:
+    # Step 1: list pods to identify which are in ImagePullBackOff and confirm waiting reason.
+    - tool: list_pods_in_namespace
+      args:
+        namespace: "{{ namespace }}"
+      extract: ["name", "status", "container_states", "creation_timestamp"]
+    # Step 2: describe the pod — confirm image reference, imagePullSecrets, and waiting message.
+    # get_kubernetes_resource returns plain str (detailed multi-line text). extract is semantic
+    # guidance for the agent, not programmatic dict-key access.
+    - tool: get_kubernetes_resource
+      args:
+        resource_type: "pod"
+        name: "{{ pod }}"
+        namespace: "{{ namespace }}"
+        output_format: "detailed"
+      extract: ["status", "containerStatuses", "waiting.reason", "waiting.message", "image", "imagePullSecrets"]
+    # Step 3: namespace events — surface Failed/BackOff pull events with the exact error message
+    # from the kubelet (bad tag, 401 unauthorized, manifest unknown, etc.).
+    # Use last_n_events to avoid time_period filtering out recent events (see crashloopbackoff note).
+    - tool: smart_get_namespace_events
+      args:
+        namespace: "{{ namespace }}"
+        last_n_events: 50
+        focus_areas: ["errors", "warnings", "failures"]
+      extract: ["events", "insights", "recommendations"]
+    # Step 4: verify the pull secret exists and is of type kubernetes.io/dockerconfigjson.
+    # on_failure: skip — some namespaces use node-level auth (ECR IRSA, OCP integrated registry)
+    # and have no explicit imagePullSecret on the pod.
+    - tool: get_kubernetes_resource
+      args:
+        resource_type: "secret"
+        name: "{{ pull_secret | default('pull-secret') }}"
+        namespace: "{{ namespace }}"
+        output_format: "yaml"
+      extract: ["type", "metadata.name", "data keys"]
+      on_failure: skip
+  analysis:
+    compare:
+      - "waiting.reason and waiting.message from get_kubernetes_resource vs event messages from smart_get_namespace_events — both should name the same image and error"
+      - "image reference on the pod spec (registry/repo:tag or digest) — check for typos, non-existent tag, or wrong registry host"
+      - "imagePullSecrets list on the pod vs Secrets present in the namespace — missing, expired, or wrong-type secrets are the most common cause"
+    check:
+      - "Is the waiting reason ImagePullBackOff or ErrImagePull? ErrImagePull is the first failure; ImagePullBackOff is the subsequent exponential-backoff state — both use this runbook."
+      - "Does the event message say '401 Unauthorized' or 'authentication required'? → pull secret missing, expired, or not linked to the service account."
+      - "Does the event message say 'manifest unknown' or 'not found'? → the image tag or digest does not exist in the registry (typo, not pushed, wrong branch)."
+      - "Does the event message say 'no such host' or 'connection refused'? → registry hostname is wrong or the cluster cannot reach the registry (network/proxy issue)."
+      - "Is imagePullSecrets on the pod spec populated? If not, does the namespace's default service account have the secret attached?"
+      - "Is the pull secret of type kubernetes.io/dockerconfigjson (not Opaque)? Opaque secrets are ignored by the kubelet image puller."
+      - "Was this pod just created after a deploy that bumped the image tag? Confirm the new tag was actually pushed before the deploy."
+  remediation:
+    - "Fix the image reference in the workload definition (Deployment/StatefulSet/Task) — correct registry host, repo path, and tag/digest"
+    - "Create or update the pull secret: oc create secret docker-registry <name> --docker-server=<registry> --docker-username=<user> --docker-password=<token> -n <namespace>"
+    - "Attach the pull secret to the namespace's default service account if pods do not declare imagePullSecrets explicitly: oc secrets link default <secret-name> --for=pull -n <namespace>"
+    - "If the pull secret exists but is expired (401), rotate the registry credentials and update the Secret data field"
+    - "For OCP internal registry pulls, confirm the imagestream tag exists and the service account has 'system:image-puller' in the namespace"
+    - "For ECR/GCR with short-lived tokens, verify the token-refresh mechanism (IRSA CronJob, ECR credential helper) is healthy"
+    - "If the registry is unreachable (DNS/proxy), fix the network path — this is not fixable by rotating credentials"
+  verification:
+    - "Rerun list_pods_in_namespace and confirm no pods remain in ImagePullBackOff or ErrImagePull"
+    - "Rerun smart_get_namespace_events and confirm Failed/BackOff pull events stopped appearing"
+    - "Confirm the pod transitions to Running/Completed (not CrashLoopBackOff — if it does, hand off to crashloopbackoff runbook)"
+  rollback:
+    - "If a new image tag was deployed and pull fails (manifest unknown), roll back the Deployment/StatefulSet to the previous image reference"
+    - "Revert the GitOps PR / ArgoCD sync if the bad image reference was merged via GitOps"
+  escalation:
+    condition: "ImagePullBackOff persists after correcting the image reference and pull secret, registry is reachable from other pods, and the secret is valid — may indicate a node-level credential cache issue or a registry-side quota/rate-limit problem"
+    target: "Cluster platform team for node credential / registry proxy issues; registry owner for rate-limit or quota exhaustion; owning application team if the image was simply never pushed"
