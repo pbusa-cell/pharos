@@ -36,6 +36,7 @@ they operate on (per ADR-006). It provides:
 │   ├── README.md
 │   ├── certificate-expiry.yaml
 │   ├── crashloopbackoff.yaml
+│   ├── imagepullbackoff.yaml
 │   ├── oomkilled.yaml
 │   └── tekton-timeout.yaml
 │
@@ -144,9 +145,8 @@ Sequence's log-retrieval chain (see above) expressed in one runbook's diagnostic
 that reads only this schema summary and skips the actual runbook YAML would miss that the chain
 is encoded there, not just described in prose.
 
-Four runbooks are currently defined: `certificate-expiry`, `crashloopbackoff`, `oomkilled`,
-`tekton-timeout`. A fifth (`imagepullbackoff`, SPRE-5974) is in progress and will land directly in
-this repository. Each runbook's `diagnostic_steps` reference real Pharos MCP tools; when executing
+Five runbooks are currently defined: `certificate-expiry`, `crashloopbackoff`, `imagepullbackoff`,
+`oomkilled`, `tekton-timeout`. Each runbook's `diagnostic_steps` reference real Pharos MCP tools; when executing
 them, remember to add `source=<cluster>` to every tool call per "Multi-Cluster Dispatch" above —
 the runbook YAML itself predates multi-cluster and does not encode `source` explicitly.
 

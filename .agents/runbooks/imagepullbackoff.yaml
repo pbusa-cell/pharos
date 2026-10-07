@@ -21,7 +21,6 @@ spec:
     events:
       - "ImagePullBackOff"
       - "ErrImagePull"
-      - "Failed"
   diagnostic_steps:
     # Step 1: list pods to identify which are in ImagePullBackOff and confirm waiting reason.
     - tool: list_pods_in_namespace
@@ -47,16 +46,17 @@ spec:
         last_n_events: 50
         focus_areas: ["errors", "warnings", "failures"]
       extract: ["events", "insights", "recommendations"]
-    # Step 4: verify the pull secret exists and is of type kubernetes.io/dockerconfigjson.
-    # on_failure: skip — some namespaces use node-level auth (ECR IRSA, OCP integrated registry)
-    # and have no explicit imagePullSecret on the pod.
+    # Step 4: read the pod's ServiceAccount to check its imagePullSecrets.
+    # pharos-reader has no Secret access (403 by design) — use the SA instead.
+    # The SA's imagePullSecrets reveals whether a pull secret is attached at the SA
+    # level, which applies when pods don't declare imagePullSecrets explicitly.
     - tool: get_kubernetes_resource
       args:
-        resource_type: "secret"
-        name: "{{ pull_secret | default('pull-secret') }}"
+        resource_type: "serviceaccount"
+        name: "{{ service_account | default('default') }}"
         namespace: "{{ namespace }}"
-        output_format: "yaml"
-      extract: ["type", "metadata.name", "data keys"]
+        output_format: "detailed"
+      extract: ["imagePullSecrets", "metadata.name"]
       on_failure: skip
   analysis:
     compare:
@@ -68,11 +68,11 @@ spec:
       - "Does the event message say '401 Unauthorized' or 'authentication required'? → pull secret missing, expired, or not linked to the service account."
       - "Does the event message say 'manifest unknown' or 'not found'? → the image tag or digest does not exist in the registry (typo, not pushed, wrong branch)."
       - "Does the event message say 'no such host' or 'connection refused'? → registry hostname is wrong or the cluster cannot reach the registry (network/proxy issue)."
-      - "Is imagePullSecrets on the pod spec populated? If not, does the namespace's default service account have the secret attached?"
-      - "Is the pull secret of type kubernetes.io/dockerconfigjson (not Opaque)? Opaque secrets are ignored by the kubelet image puller."
+      - "Is imagePullSecrets on the pod spec populated? If not, does the pod's ServiceAccount (step 4) have imagePullSecrets attached?"
       - "Was this pod just created after a deploy that bumped the image tag? Confirm the new tag was actually pushed before the deploy."
   remediation:
     - "Fix the image reference in the workload definition (Deployment/StatefulSet/Task) — correct registry host, repo path, and tag/digest"
+    - "Verify the pull secret type manually: oc get secret <name> -n <namespace> -o jsonpath='{.type}' — must be kubernetes.io/dockerconfigjson, not Opaque (Opaque secrets are ignored by the kubelet image puller)"
     - "Create or update the pull secret: oc create secret docker-registry <name> --docker-server=<registry> --docker-username=<user> --docker-password=<token> -n <namespace>"
     - "Attach the pull secret to the namespace's default service account if pods do not declare imagePullSecrets explicitly: oc secrets link default <secret-name> --for=pull -n <namespace>"
     - "If the pull secret exists but is expired (401), rotate the registry credentials and update the Secret data field"
