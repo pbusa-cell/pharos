@@ -58,47 +58,25 @@ Claude Code expands `${PHAROS_STAGE_TOKEN}` at launch, so nothing secret lands i
 
 Restart Claude Code; tools appear as `mcp__pharos-stage__*`.
 
-## How to test it
-
-### Option A — scripted check (fastest)
-
-```bash
-cd <pharos repo>
-export PHAROS_STAGE_TOKEN='<token from Vault>'
-./scripts/validate-stage.sh                            # in-cluster source only
-./scripts/validate-stage.sh <cluster-a> <cluster-b>    # once prod sources are registered
-```
-
-A good run ends with:
-```
-== fail-closed check (no token) ==
-  PASS (401)
-== tools/list ==
-  200 OK
-== tools against source=<in-cluster> ==
-  list_sources          200 OK
-  list_namespaces       200 OK
-  ... (12 tools total)
-== summary: 12/12 tool calls OK across 1 source(s) ==
-```
-`12/12 OK` means the endpoint works. It prints `ACCEPTANCE PARTIAL` until two prod `source=`
-names are passed — expected while the prod blocker (below) stands.
-
-### Option B — interactive, via Claude Code
+## Validate your connection
 
 1. Add the [MCP config block](#mcp-config-block) above to your `.mcp.json`.
 2. In the shell you launch Claude Code from: `export PHAROS_STAGE_TOKEN='<token>'`
-3. Restart Claude Code, then ask, e.g.:
+3. Restart Claude Code. The tools appear as `mcp__pharos-stage__*`.
+4. Run a short investigation that exercises several tools, e.g.:
    - "List the namespaces on stage" → `mcp__pharos-stage__list_namespaces`
    - "Check cluster certificate health on stage"
-   - "Show recent events in the spre-automations namespace"
+   - "Show recent events in the `spre-automations` namespace"
+   - "Summarise the pods in `openshift-apiserver`"
+
+If the tools return data, your connection works — tick yourself off in the checklist below.
 
 > Don't invoke the whole-cluster scan tools (`live_system_topology_mapper`, `topology_mapper`,
 > `resource_bottleneck_forecaster`, `predictive_log_analyzer`) — they crash the pod (SPRE-7074).
 
-**Stage result (2026-10-13):** fail-closed ✓, auth ✓, `tools/list` ✓ (37 tools, profile
-`konflux`), **12/12 tools OK** against the in-cluster source. `list_sources` shows one source
-(`kubernetes`, connected) — no prod sources registered yet (see below).
+**Validated 2026-10-13:** fail-closed ✓, auth ✓, 37 tools exposed (profile `konflux`), tools
+run against the in-cluster source. `list_sources` shows one source (`kubernetes`, connected) —
+no prod sources registered yet (see below).
 
 ## ⚠️ Known limitations (2026-10-13)
 
@@ -111,13 +89,12 @@ names are passed — expected while the prod blocker (below) stands.
 2. **Pod OOMKilled under whole-cluster scan tools (SPRE-7074).** The pod's memory limit is
    512Mi; tools that fan out across all namespaces in parallel (`live_system_topology_mapper`,
    `topology_mapper`, `resource_bottleneck_forecaster`, `predictive_log_analyzer`) crash it
-   (exit 137) and the Route returns 503 until restart. `validate-stage.sh` excludes these from
-   its default set so the run is pod-safe. Avoid them until SPRE-7074 is fixed.
+   (exit 137) and the Route returns 503 until restart. Avoid these tools until SPRE-7074 is fixed.
 
 ## Per-engineer checklist
 
-Tracked in SPRE-6652. Each engineer: connect, run `validate-stage.sh`, tick below, file bugs
-for any failing tool.
+Tracked in SPRE-6652. Each engineer: connect, run an investigation exercising ≥10 tools, tick
+below, and file bugs for any failing tool.
 
 | Engineer | Connected | ≥10 tools | ≥2 prod clusters | Bugs filed |
 |---|---|---|---|---|
