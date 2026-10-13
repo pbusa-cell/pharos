@@ -90,17 +90,3 @@ no prod sources registered yet (see below).
    512Mi; tools that fan out across all namespaces in parallel (`live_system_topology_mapper`,
    `topology_mapper`, `resource_bottleneck_forecaster`, `predictive_log_analyzer`) crash it
    (exit 137) and the Route returns 503 until restart. Avoid these tools until SPRE-7074 is fixed.
-
-## Per-engineer checklist
-
-Tracked in SPRE-6652. Each engineer: connect, run an investigation exercising ≥10 tools, tick
-below, and file bugs for any failing tool.
-
-| Engineer | Connected | ≥10 tools | ≥2 prod clusters | Bugs filed |
-|---|---|---|---|---|
-| Prathamesh | ✅ | ✅ (12/12 stage) | ☐ (blocked) | SPRE-7074 |
-| Georgi | ☐ | ☐ | ☐ (blocked) | — |
-| Sachin | ☐ | ☐ | ☐ (blocked) | — |
-| Ayush | ☐ | ☐ | ☐ (blocked) | — |
-| Diksha | ☐ | ☐ | ☐ (blocked) | — |
-| Radha | ☐ | ☐ | ☐ (blocked) | — |
