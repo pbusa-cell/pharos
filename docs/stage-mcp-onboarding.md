@@ -60,16 +60,26 @@ With `PHAROS_STAGE_TOKEN` set, run the scripted check:
 ./scripts/validate-stage.sh <cluster-a> <cluster-b>   # once prod sources are registered
 ```
 
-It confirms reachability, fail-closed auth, `tools/list`, and exercises ≥10 read-only tools.
+It confirms reachability, fail-closed auth, `tools/list`, and exercises 12 read-only tools.
 Pass two registered `source=` names to satisfy the ≥2-prod-cluster acceptance criterion.
 
-## ⚠️ Known limitation (2026-10-13)
+**Stage result (2026-10-13):** fail-closed ✓, auth ✓, `tools/list` ✓ (37 tools, profile
+`konflux`), **12/12 tools OK** against the in-cluster source. `list_sources` shows one source
+(`kubernetes`, connected) — no prod sources registered yet (see below).
 
-`source=` **multi-cluster dispatch is not yet functional.** `pharos-config` has an empty
-`cluster_registry` and no mounted credentials, because the read-only prod ServiceAccounts
-(**SPRE-6614**, Backlog) do not exist yet and their tokens (**SPRE-6648**, in Review) are not
-delivered. Until both land, validation can only target the in-cluster (stage) source, and the
-"≥10 tools across ≥2 prod clusters" criterion cannot be met. See the SPRE-6652 comment thread.
+## ⚠️ Known limitations (2026-10-13)
+
+1. **`source=` multi-cluster dispatch is not yet functional.** `pharos-config` has an empty
+   `cluster_registry` and no mounted credentials, because the read-only prod ServiceAccounts
+   (**SPRE-6614**, Backlog) do not exist yet and their tokens (**SPRE-6648**, in Review) are not
+   delivered. Until both land, validation targets only the in-cluster (stage) source, and the
+   "≥10 tools across ≥2 prod clusters" criterion cannot be met.
+
+2. **Pod OOMKilled under whole-cluster scan tools (SPRE-7074).** The pod's memory limit is
+   512Mi; tools that fan out across all namespaces in parallel (`live_system_topology_mapper`,
+   `topology_mapper`, `resource_bottleneck_forecaster`, `predictive_log_analyzer`) crash it
+   (exit 137) and the Route returns 503 until restart. `validate-stage.sh` excludes these from
+   its default set so the run is pod-safe. Avoid them until SPRE-7074 is fixed.
 
 ## Per-engineer checklist
 
@@ -78,7 +88,7 @@ for any failing tool.
 
 | Engineer | Connected | ≥10 tools | ≥2 prod clusters | Bugs filed |
 |---|---|---|---|---|
-| Prathamesh | ☐ | ☐ | ☐ (blocked) | — |
+| Prathamesh | ✅ | ✅ (12/12 stage) | ☐ (blocked) | SPRE-7074 |
 | Georgi | ☐ | ☐ | ☐ (blocked) | — |
 | Sachin | ☐ | ☐ | ☐ (blocked) | — |
 | Ayush | ☐ | ☐ | ☐ (blocked) | — |

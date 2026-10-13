@@ -12,21 +12,26 @@ URL="${PHAROS_URL:-https://pharos-spre-automations.apps.rosa.kflux-c-stg-i01.qfl
 SOURCES=("$@"); [ ${#SOURCES[@]} -eq 0 ] && SOURCES=("")   # "" = default in-cluster source
 
 ns="${PHAROS_NS:-openshift-apiserver}"   # a namespace that exists on every OCP cluster
-# tool:json-args  (args merged with {"source": <cluster>} when a source is given)
+sns="${PHAROS_SMALL_NS:-spre-automations}"  # small ns for per-namespace scans (memory-safe)
+# tool:json-args  (names verified against this deployment's tools/list;
+#  args merged with {"source": <cluster>} when a source is given)
 TOOLS=(
+  'list_sources:{}'
   'list_namespaces:{}'
-  'get_openshift_cluster_operator_status:{}'
-  'check_cluster_certificate_health:{}'
-  'get_machine_config_pool_status:{}'
-  'conservative_namespace_overview:{"namespace":"'"$ns"'"}'
   'list_pods_in_namespace:{"namespace":"'"$ns"'"}'
+  'check_cluster_certificate_health:{}'
+  'investigate_tls_certificate_issues:{}'
+  'conservative_namespace_overview:{"namespace":"'"$sns"'"}'
   'smart_get_namespace_events:{"namespace":"'"$ns"'"}'
-  'list_recent_pipeline_runs:{}'
-  'live_system_topology_mapper:{}'
+  'check_resource_constraints:{"namespace":"'"$sns"'"}'
+  'detect_anomalies:{"namespace":"'"$sns"'"}'
+  'adaptive_namespace_investigation:{"namespace":"'"$sns"'"}'
+  'progressive_event_analysis:{"namespace":"'"$sns"'"}'
   'prometheus_query:{"query":"up"}'
-  'detect_anomalies:{}'
-  'check_resource_constraints:{}'
 )
+# ponytail: topology/forecaster/predictive tools omitted from the default set — they
+# scan 100+ namespaces in parallel and OOM-crashed the 512Mi stage pod (OOMKilled,
+# exit 137, observed 2026-10-13). Run those individually with a namespace filter.
 
 call() { # method, params-json -> body on stdout, sets HTTP in global
   local method="$1" params="$2"
@@ -37,23 +42,27 @@ call() { # method, params-json -> body on stdout, sets HTTP in global
     -d '{"jsonrpc":"2.0","id":1,"method":"'"$method"'","params":'"$params"'}'
 }
 
-ok_json() { # stdin: curl body incl trailing status line -> prints "HTTP <code>" + jsonrpc ok?
-  python3 - "$@" <<'PY'
+# Parser in a temp file so the curl output stays on stdin (a `python3 - <<EOF`
+# heredoc would hijack stdin and read the script instead of the piped response).
+PARSER=$(mktemp)
+trap 'rm -f "$PARSER"' EXIT
+cat > "$PARSER" <<'PY'
 import sys,json
 raw=sys.stdin.read().rsplit("\n",1)
 body,code=raw[0], (raw[1] if len(raw)>1 else "")
-# strip SSE "data: " framing if present
-lines=[l[6:] if l.startswith("data: ") else l for l in body.strip().splitlines()]
-txt="\n".join(l for l in lines if l.strip())
+# SSE framing: keep only "data: " lines, drop "event:" and blanks
+lines=[l[6:] for l in body.strip().splitlines() if l.startswith("data: ")]
+txt="\n".join(lines) or body.strip()
 err=""
 try:
     d=json.loads(txt)
     if "error" in d: err=str(d["error"].get("message",d["error"]))[:80]
+    elif d.get("result",{}).get("isError"): err="tool isError=true"
 except Exception as e:
     err=f"unparseable ({e})"
 print(code, "OK" if (code=="200" and not err) else f"FAIL {err}")
 PY
-}
+ok_json() { python3 "$PARSER"; }  # stdin: curl body + trailing status line
 
 echo "Endpoint: $URL"
 echo "== fail-closed check (no token) =="
