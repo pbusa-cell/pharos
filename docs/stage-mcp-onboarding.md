@@ -19,12 +19,19 @@ without secret access). Fetch it from the AppSRE Vault:
 
 | | |
 |---|---|
-| **Vault** | `https://vault.ci.ext.devshift.net` |
+| **Vault UI** | https://vault.devshift.net/ui/vault/secrets/stonesoup/kv/list/staging/spre/ |
 | **Mount** | `stonesoup` |
 | **Key** | `staging/spre/pharos-token` → field `LUMINO_HTTP_TOKEN` |
 
+Requires the `spre-staging-vault` role — add it to your app-interface user file if you don't
+have it yet (one-line `$ref`, see app-interface MR !210885 for the pattern).
+
+**Browser:** open the Vault UI link above, log in with OIDC, open `pharos-token`, copy
+`LUMINO_HTTP_TOKEN`.
+
+**CLI:**
 ```bash
-export VAULT_ADDR=https://vault.ci.ext.devshift.net
+export VAULT_ADDR=https://vault.devshift.net
 vault login -method=oidc                       # SSO
 export PHAROS_STAGE_TOKEN=$(vault kv get -mount=stonesoup -field=LUMINO_HTTP_TOKEN staging/spre/pharos-token)
 ```
