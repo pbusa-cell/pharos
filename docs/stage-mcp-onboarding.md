@@ -1,7 +1,8 @@
 # Pharos Stage — Team MCP Onboarding
 
 How to connect a local MCP client (Claude Code) to the **stage** Pharos Route and run
-read-only investigations against production clusters. Tracks SPRE-6652.
+read-only investigations against the stage cluster. (Multi-cluster prod dispatch is not
+live yet — see [Known limitations](#️-known-limitations-2026-10-13).) Tracks SPRE-6652.
 
 ## Endpoint
 
@@ -39,6 +40,10 @@ export PHAROS_STAGE_TOKEN=$(vault kv get -mount=stonesoup -field=LUMINO_HTTP_TOK
 > Never paste the token into a file, commit, or Jira comment. Keep it in the
 > `PHAROS_STAGE_TOKEN` env var only.
 
+> ⚠️ **Write access.** The `spre-staging-vault` role grants write and delete on all of
+> `stonesoup/staging/spre/*`, not just this key. Read **only** the `pharos-token` field —
+> do not edit, overwrite, or delete anything else under that path.
+
 ## MCP config block
 
 Add to your project `.mcp.json` (or `~/.claude.json`). The token stays in the env var —
@@ -74,9 +79,7 @@ If the tools return data, your connection works — tick yourself off in the che
 > Don't invoke the whole-cluster scan tools (`live_system_topology_mapper`, `topology_mapper`,
 > `resource_bottleneck_forecaster`, `predictive_log_analyzer`) — they crash the pod (SPRE-7074).
 
-**Validated 2026-10-13:** fail-closed ✓, auth ✓, 37 tools exposed (profile `konflux`), tools
-run against the in-cluster source. `list_sources` shows one source (`kubernetes`, connected) —
-no prod sources registered yet (see below).
+Live validation results (tool pass/fail, source counts) are recorded on SPRE-6652.
 
 ## ⚠️ Known limitations (2026-10-13)
 
@@ -90,3 +93,16 @@ no prod sources registered yet (see below).
    512Mi; tools that fan out across all namespaces in parallel (`live_system_topology_mapper`,
    `topology_mapper`, `resource_bottleneck_forecaster`, `predictive_log_analyzer`) crash it
    (exit 137) and the Route returns 503 until restart. Avoid these tools until SPRE-7074 is fixed.
+
+## Per-engineer checklist
+
+Tracked in SPRE-6652. Each engineer: connect, run an investigation exercising ≥10 tools, tick
+your row, and file bugs for any failing tool. (The ≥2-prod-clusters column stays blocked until
+SPRE-6614 / SPRE-6648 land — see Known limitations.)
+
+| Engineer | Date | Single-source (≥10 tools) | Multi-cluster (≥2 prod) | Bugs filed |
+|---|---|---|---|---|
+| | | ☐ | ☐ (blocked) | |
+| | | ☐ | ☐ (blocked) | |
+| | | ☐ | ☐ (blocked) | |
+| | | ☐ | ☐ (blocked) | |

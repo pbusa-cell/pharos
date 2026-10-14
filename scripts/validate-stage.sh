@@ -29,7 +29,7 @@ TOOLS=(
   'progressive_event_analysis:{"namespace":"'"$sns"'"}'
   'prometheus_query:{"query":"up"}'
 )
-# ponytail: topology/forecaster/predictive tools omitted from the default set — they
+# NOTE: topology/forecaster/predictive tools omitted from the default set — they
 # scan 100+ namespaces in parallel and OOM-crashed the 512Mi stage pod (OOMKilled,
 # exit 137, observed 2026-10-13). Run those individually with a namespace filter.
 
@@ -69,27 +69,37 @@ echo "== fail-closed check (no token) =="
 code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$URL" -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' --max-time 20)
-[ "$code" = "401" ] && echo "  PASS (401)" || { echo "  FAIL: expected 401, got $code"; }
+fail=0   # any required check that fails flips this; script exits non-zero
+[ "$code" = "401" ] && echo "  PASS (401)" || { echo "  FAIL: expected 401, got $code"; fail=1; }
 
 echo "== tools/list =="
 read -r tlcode tlstat < <(call tools/list '{}' | ok_json)
 echo "  $tlcode $tlstat"
+[ "$tlstat" = "OK" ] || fail=1
 
-pass=0; total=0
+min=0   # count of sources clearing >=10 OK; must equal #sources for acceptance
 for src in "${SOURCES[@]}"; do
   label="${src:-<in-cluster>}"
   echo "== tools against source=$label =="
+  pass=0; total=0
   for entry in "${TOOLS[@]}"; do
     name="${entry%%:*}"; args="${entry#*:}"
     [ -n "$src" ] && args=$(python3 -c "import json,sys;a=json.loads(sys.argv[1]);a['source']=sys.argv[2];print(json.dumps(a))" "$args" "$src")
     params='{"name":"'"$name"'","arguments":'"$args"'}'
     read -r c s < <(call tools/call "$params" | ok_json)
     printf "  %-40s %s %s\n" "$name" "$c" "$s"
-    total=$((total+1)); [ "$s" = "OK" ] && pass=$((pass+1))
+    total=$((total+1)); [ "$s" = "OK" ] && pass=$((pass+1)) || fail=1
   done
+  echo "  source=$label: $pass/$total OK"
+  [ "$pass" -ge 10 ] && min=$((min+1))
 done
 
-echo "== summary: $pass/$total tool calls OK across ${#SOURCES[@]} source(s) =="
-# acceptance: >=10 distinct tools OK and >=2 real sources
-[ "$pass" -ge 10 ] && [ "${#SOURCES[@]}" -ge 2 ] && [ -n "${SOURCES[0]}" ] \
-  && echo "ACCEPTANCE MET" || echo "ACCEPTANCE PARTIAL (need >=10 OK across >=2 named prod sources)"
+echo "== summary: $min/${#SOURCES[@]} source(s) cleared >=10 tools OK =="
+# acceptance: EVERY source clears >=10 OK, and >=2 real (named) prod sources
+if [ "$min" -eq "${#SOURCES[@]}" ] && [ "${#SOURCES[@]}" -ge 2 ] && [ -n "${SOURCES[0]}" ]; then
+  echo "ACCEPTANCE MET"
+else
+  echo "ACCEPTANCE PARTIAL (need >=10 OK per source across >=2 named prod sources)"
+fi
+
+exit "$fail"
