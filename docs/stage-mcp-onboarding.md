@@ -84,10 +84,10 @@ Live validation results (tool pass/fail, source counts) are recorded on SPRE-665
 ## ⚠️ Known limitations (2026-10-13)
 
 1. **`source=` multi-cluster dispatch is not yet functional.** `pharos-config` has an empty
-   `cluster_registry` and no mounted credentials, because the read-only prod ServiceAccounts
-   (**SPRE-6614**, Backlog) do not exist yet and their tokens (**SPRE-6648**, in Review) are not
-   delivered. Until both land, validation targets only the in-cluster (stage) source, and the
-   "≥10 tools across ≥2 prod clusters" criterion cannot be met.
+   `cluster_registry` and no mounted credentials. Tracked in **SPRE-7090**, blocked by
+   **SPRE-6648** (prod SA tokens) and **KFLUXINFRA-4683**. Until it lands, validation targets
+   only the in-cluster (stage) source, and the "≥10 tools across ≥2 prod clusters" criterion
+   cannot be met.
 
 2. **Pod OOMKilled under whole-cluster scan tools (SPRE-7074).** The pod's memory limit is
    512Mi; tools that fan out across all namespaces in parallel (`live_system_topology_mapper`,
@@ -102,7 +102,7 @@ SPRE-6614 / SPRE-6648 land — see Known limitations.)
 
 | Engineer | Date | Single-source (≥10 tools) | Multi-cluster (≥2 prod) | Bugs filed |
 |---|---|---|---|---|
-| | | ☐ | ☐ (blocked) | |
+| Prathamesh | 2026-10-13 | ✅ (12/12) | ☐ (blocked) | SPRE-7074 |
 | | | ☐ | ☐ (blocked) | |
 | | | ☐ | ☐ (blocked) | |
 | | | ☐ | ☐ (blocked) | |

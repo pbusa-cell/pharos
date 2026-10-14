@@ -26,11 +26,13 @@ Optional overrides: `PHAROS_URL`, `PHAROS_NS` (default `openshift-apiserver`),
   list_sources          200 OK
   list_namespaces       200 OK
   ... (12 tools total)
-== summary: 12/12 tool calls OK across 1 source(s) ==
+  source=<in-cluster>: 12/12 OK
+== summary: 1/1 source(s) cleared >=10 tools OK ==
 ```
 
 `12/12 OK` ⇒ the endpoint works. The script prints `ACCEPTANCE PARTIAL` until two prod
-`source=` names are passed — expected while the prod blocker stands (SPRE-6614 / SPRE-6648).
+`source=` names are passed and each clears ≥10 OK — expected while the prod blocker stands
+(SPRE-7090, blocked by SPRE-6648 and KFLUXINFRA-4683).
 
 ## Notes
 
